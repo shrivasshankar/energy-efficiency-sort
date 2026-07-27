@@ -7,31 +7,66 @@
 #include <filesystem>
 #include <chrono>
 #include <cstring>
+
+#include <stdexcept>    // runtime_error
+
+const int KS = 10;               // key size
+const int RECORD_SIZE = 100;
+
 namespace fs = std::filesystem;
 using namespace std;
 
-const int RECORD_SIZE = 100;
 
-// Stores a key pointer pair being merged
-// fileindex tracks which sorted run this index came from
-struct Node {
-    string record;      // full 100-byte record
-    int fileIndex;
+// A bounded, buffered reader over ONE slice of ONE run file.
+// Bounded from the start: Stage A passes the whole file,
+// Stage B passes a slice. Writing it this way now avoids a rewrite.
+struct Seg {
+    ifstream in;
+    vector<char> buf;
+    size_t pos = 0, len = 0, cap;
+    size_t remaining;        // records left in MY slice, not the file
+
+    Seg(const string& f, size_t startRec, size_t nrec, size_t bufRecs)
+        : in(f, ios::binary), buf(bufRecs * RECORD_SIZE),
+          cap(bufRecs * RECORD_SIZE), remaining(nrec) {
+        if (!in) throw runtime_error("open failed: " + f);
+        in.seekg((streamoff)startRec * RECORD_SIZE);
+    }
+
+    const char* front() const { return &buf[pos]; }
+
+    bool refill() {
+        size_t want = min(cap, remaining * RECORD_SIZE);
+        if (!want) return false;
+        in.read(buf.data(), (streamsize)want);
+        len = (size_t)in.gcount();
+        remaining -= len / RECORD_SIZE;
+        pos = 0;
+        return len >= RECORD_SIZE;
+    }
+
+    bool advance() {
+        pos += RECORD_SIZE;
+        if (pos + RECORD_SIZE <= len) return true;  // already in memory
+        return refill();                            // drained -> one read
+    }
 };
 
-// compare for a min heap so smallest is at the top; 
-struct Compare{
-     bool operator()(const Node& a, const Node& b) const {
-        return memcmp(a.record.data(), b.record.data(), 10) > 0;
+// Heap entry points INTO a Seg's buffer -- no copy, no allocation.
+struct Item { const char* rec; int seg; };
+struct Cmp {
+    bool operator()(const Item& a, const Item& b) const {
+        return memcmp(a.rec, b.rec, KS) > 0;    // > 0 == min-heap
     }
 };
 
 int main() {
     auto start = chrono::high_resolution_clock::now(); // start timer
 
-    priority_queue<Node, vector<Node>, Compare> pq; 
+    const size_t BUFRECS = 8192;          // ~800KB per stream
+    priority_queue<Item, vector<Item>, Cmp> pq;
     vector<string> runFiles;
-    vector<ifstream> files;
+    vector<Seg*> segs;
  
 
     // find every run file generated during the split phase.
@@ -50,33 +85,44 @@ int main() {
 
     sort(runFiles.begin(), runFiles.end());
 
-    // open each run file for sequential reading
+    // open each run as a buffered reader over its whole length,
+    // and prime the heap in the same pass
     for (const string& filename : runFiles) {
-        files.push_back(ifstream(filename, ios::binary));
-    }
-
-    // pushes the first value of each file into the priority queue
-    for (int i = 0; i < files.size(); i++) {
-        string record(RECORD_SIZE, '\0');
-        if (files[i].read(&record[0], RECORD_SIZE)) {
-            pq.push({record, i});
+        const size_t nrec = fs::file_size(filename) / RECORD_SIZE;
+        Seg* sg = new Seg(filename, 0, nrec, BUFRECS);
+        if (sg->refill()) {
+            segs.push_back(sg);
+            pq.push({ sg->front(), (int)segs.size() - 1 });
+        } else {
+            delete sg;
         }
     }
-    // writes out
-    ofstream out ("output.txt", ios::binary);
+
+    ofstream out("output.dat", ios::binary);
+    vector<char> ob;                      // batch the writes too
+    ob.reserve(BUFRECS * RECORD_SIZE);
+
+    
     // pops the smallest value and writes to output
     // then it inserts the record from the same run
     while (!pq.empty()) {
-        Node curr = pq.top();
+        Item it = pq.top();
         pq.pop();
 
-        out.write(curr.record.data(), RECORD_SIZE);   // no seek, no values.dat
-
-        string next(RECORD_SIZE, '\0');
-        if (files[curr.fileIndex].read(&next[0], RECORD_SIZE)) {
-            pq.push({next, curr.fileIndex});
+        // COPY OUT FIRST: advance() may overwrite the buffer
+        // that it.rec points into.
+        ob.insert(ob.end(), it.rec, it.rec + RECORD_SIZE);
+        if (ob.size() >= BUFRECS * RECORD_SIZE) {
+            out.write(ob.data(), (streamsize)ob.size());
+            ob.clear();
         }
+
+        Seg* sg = segs[it.seg];
+        if (sg->advance()) pq.push({ sg->front(), it.seg });
     }
+    if (!ob.empty()) out.write(ob.data(), (streamsize)ob.size());
+
+    for (Seg* x : segs) delete x;
 
     auto end = chrono::high_resolution_clock::now();
 
