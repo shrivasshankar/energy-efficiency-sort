@@ -1,15 +1,20 @@
 # compiled programs
 split_program
 merge_program
+std_sort
 std_sort_program
 
-# generated files
+# generated run files and sorted output
+run*.dat
 run*.txt
+output.dat
 output.txt
 std_output.txt
+values.dat
 
-# datasets
+# datasets (regenerate with gensort)
 input.txt
 
 # mac files
 .DS_Store
+.metadata_never_index
