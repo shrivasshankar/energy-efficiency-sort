@@ -78,13 +78,16 @@ struct Cmp {
 typedef array<char, KS> Key;
 
 // first record index in this run whose key is STRICTLY GREATER than sp
-static size_t upperBoundInRun(ifstream& f, size_t n, const char* sp) {
+// Takes a shared fd rather than its own ifstream: an ifstream carries a
+// seek cursor, so it cannot be shared, which forced this whole search to
+// run one run at a time. pread carries its offset per call, so every run
+// can be probed concurrently on one descriptor.
+static size_t upperBoundInRun(int fd, size_t n, const char* sp) {
     size_t lo = 0, hi = n;
     char key[KS];
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        f.seekg((streamoff)mid * RECORD_SIZE);
-        f.read(key, KS);
+        if (pread(fd, key, KS, (off_t)mid * RECORD_SIZE) != (ssize_t)KS) break;
         if (memcmp(key, sp, KS) <= 0) lo = mid + 1;
         else                          hi = mid;
     }
@@ -106,7 +109,12 @@ int main(int argc, char** argv) {
     auto start = chrono::high_resolution_clock::now(); // start timer
     const int    P       = argc > 1 ? stoi(argv[1])
                                     : (int)thread::hardware_concurrency();
+    // Read and output buffers are sized separately. They serve opposite
+    // patterns: BUFRECS is per input stream and there are P*K of them, so
+    // it is a memory-footprint knob. OBRECS is per thread, only P of them,
+    // and it sets how large one pwrite is.
     const size_t BUFRECS = argc > 2 ? stoull(argv[2]) : 8192;
+    const size_t OBRECS  = argc > 3 ? stoull(argv[3]) : 8192;
     vector<string> runFiles;
  
 
@@ -136,22 +144,51 @@ int main(int argc, char** argv) {
         total += nrec[r];
     }
 
+    // One descriptor per run, opened once here and shared by the sampler,
+    // the cut table, and the merge. All three only ever pread, so sharing
+    // is safe, and each run gets opened once instead of three times.
+    vector<int> runFd(K);
+    for (int r = 0; r < K; r++) {
+        runFd[r] = open(runFiles[r].c_str(), O_RDONLY);
+        if (runFd[r] < 0) { perror(runFiles[r].c_str()); return 1; }
+    }
+
     // Runs are alr sorted, so evenly-spaced records are that run's
     // quantiles. Oversample 32x per bucket so splitters land close to
     // the true quantiles.
+    //
+    // Runs sample independently, so this fans out over threads. Serial, it
+    // was K*S dependent seek-then-read pairs at queue depth 1 -- all
+    // latency, no throughput. Samples are gathered per run and concatenated
+    // in run order below, so the sorted sample -- and therefore every
+    // splitter -- is identical to what the serial version produced.
     const int S = 32 * P;
-    vector<Key> sample;
-    for (int r = 0; r < K; r++) {
-        ifstream f(runFiles[r], ios::binary);
-        for (int t = 1; t <= S; t++) {
-            size_t idx = (size_t)((double)t / (S + 1) * nrec[r]);
-            if (idx >= nrec[r]) continue;
-            Key k;
-            f.seekg((streamoff)idx * RECORD_SIZE);
-            f.read(k.data(), KS);
-            sample.push_back(k);
-        }
+    vector<vector<Key>> perRun(K);
+    {
+        atomic<size_t> nextRun{0};
+        auto sampler = [&]{
+            size_t r;
+            while ((r = nextRun.fetch_add(1)) < (size_t)K) {
+                perRun[r].reserve(S);
+                for (int t = 1; t <= S; t++) {
+                    size_t idx = (size_t)((double)t / (S + 1) * nrec[r]);
+                    if (idx >= nrec[r]) continue;
+                    Key k;
+                    if (pread(runFd[r], k.data(), KS,
+                              (off_t)idx * RECORD_SIZE) == (ssize_t)KS)
+                        perRun[r].push_back(k);
+                }
+            }
+        };
+        vector<thread> pool;
+        for (int t = 0; t < P; t++) pool.emplace_back(sampler);
+        for (auto& th : pool) th.join();
     }
+
+    vector<Key> sample;
+    for (int r = 0; r < K; r++)
+        sample.insert(sample.end(), perRun[r].begin(), perRun[r].end());
+
     sort(sample.begin(), sample.end(), [](const Key& a, const Key& b){
         return memcmp(a.data(), b.data(), KS) < 0;
     });
@@ -163,13 +200,27 @@ int main(int argc, char** argv) {
 
     // cut[r][j] = first record index in run r belonging to segment j.
     // Segment j of run r is records [ cut[r][j], cut[r][j+1] ).
+    //
+    // Parallel over runs, same reasoning as the sampler: K*(P-1) binary
+    // searches, every probe a blocking read that nothing overlaps. Each
+    // thread owns whole rows of `cut`, so no two threads touch the same
+    // inner vector.
     vector<vector<size_t>> cut(K, vector<size_t>(P + 1, 0));
-    for (int r = 0; r < K; r++) {
-        ifstream f(runFiles[r], ios::binary);
-        cut[r][0] = 0;
-        cut[r][P] = nrec[r];
-        for (int j = 1; j < P; j++)
-            cut[r][j] = upperBoundInRun(f, nrec[r], spl[j - 1].data());
+    {
+        atomic<size_t> nextRun{0};
+        auto cutter = [&]{
+            size_t r;
+            while ((r = nextRun.fetch_add(1)) < (size_t)K) {
+                cut[r][0] = 0;
+                cut[r][P] = nrec[r];
+                for (int j = 1; j < P; j++)
+                    cut[r][j] = upperBoundInRun(runFd[r], nrec[r],
+                                                spl[j - 1].data());
+            }
+        };
+        vector<thread> pool;
+        for (int t = 0; t < P; t++) pool.emplace_back(cutter);
+        for (auto& th : pool) th.join();
     }
 
     vector<size_t> segRec(P, 0), outOff(P, 0);
@@ -188,13 +239,6 @@ int main(int argc, char** argv) {
         cerr << "CUT TABLE BUG: " << acc << " vs " << total << "\n";
         return 1;
     }
-    // one descriptor per run, opened once, shared by every thread
-    vector<int> runFd(K);
-    for (int r = 0; r < K; r++) {
-        runFd[r] = open(runFiles[r].c_str(), O_RDONLY);
-        if (runFd[r] < 0) { perror(runFiles[r].c_str()); return 1; }
-    }
-
     int fd = open("output.dat", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open output.dat"); return 1; }
     if (ftruncate(fd, (off_t)total * RECORD_SIZE) != 0) {
@@ -215,7 +259,7 @@ int main(int argc, char** argv) {
         }
 
         vector<char> ob;
-        ob.reserve(BUFRECS * RECORD_SIZE);
+        ob.reserve(OBRECS * RECORD_SIZE);
         off_t off = (off_t)outOff[j];
 
         while (!pq.empty()) {
@@ -225,7 +269,7 @@ int main(int argc, char** argv) {
             // copies out first: advance() may overwrite the buffer
             // that it.rec points into.
             ob.insert(ob.end(), it.rec, it.rec + RECORD_SIZE);
-            if (ob.size() >= BUFRECS * RECORD_SIZE) {
+            if (ob.size() >= OBRECS * RECORD_SIZE) {
                 if (!writeFully(fd, ob.data(), ob.size(), off)) return;
                 off += ob.size();
                 ob.clear();
@@ -257,6 +301,7 @@ int main(int argc, char** argv) {
 
     cout << "Merge time: " << elapsed.count() << " seconds"
         << "  [threads=" << P << " runs=" << K
+        << " obKB=" << (OBRECS * RECORD_SIZE / 1024)
         << " balance min=" << *min_element(segRec.begin(), segRec.end())
         << " max="        << *max_element(segRec.begin(), segRec.end())
         << " ideal="      << total / P << "]\n";
