@@ -72,9 +72,16 @@ Both phases default to `hardware_concurrency()` if the thread count is omitted. 
 | **v2** — sorted runs, key+index sort | 86.4s | 503s | 9.8 min | 4.1× |
 | **v3** — buffered merge reads | 86.4s | 153.6s | 4.0 min | 10.1× |
 | **v4** — parallel split + sampled splitters | 34.7s | 50.9s | 85.6s | 28.4× |
-| **v5** — `pread`/`pwrite` instead of `iostream` | **30.0s** | **40.8s** | **70.8s** | **34.3×** |
+| **v5** — `pread`/`pwrite` instead of `iostream` | 30.0s | 40.8s | 70.8s | 34.3× |
+| **v6** — parallel merge setup + decoupled merge writer | 31.2s | 32.7s | 63.9s | 38.0× |
+| **v7** — decoupled split writer | **28.4s** | **26.8s** | **55.2s** | **44.0×** |
 
 v1 used a 10M-record chunk (50 runs); v2 onward use 5M (100 runs).
+
+**v1–v5 are medians; v6 and v7 are single cold trials.** They are not the same
+kind of number, and this project has measured the same binary 13.5s apart on
+different nights — so read the v6/v7 rows as one observation each, not as a
+median. The per-change measurements below are the defensible ones.
 
 **v5 is cold-start**: `sudo purge` before each trial, medians of 4. Individual samples were split 27.2 / 29.4 / 30.5 / 33.5 and merge 37.1 / 38.1 / 43.5 / 43.8 — a 6s spread on both, so treat single runs as indicative only.
 
@@ -178,7 +185,9 @@ Raw device throughput, measured with `dd` to give the sort's numbers a reference
 
 **That last row is the honest one, and it is why this section does not quote a percentage.** Repeating the identical mixed test gave a 60% spread, and the `sync`'d run came out *faster* than the unsync'd one — impossible if the measurement were stable. A single `dd` sample is not a ceiling.
 
-For scale: the sort moves 100 GB (50 read + 50 written), so split runs at ~3.3 GB/s and merge at ~2.45 GB/s. Both sit inside the band raw `dd` produces on this machine. That is suggestive of being near the limit; it is not proof, and an earlier draft of this README overclaimed it as "95% of ceiling."
+For scale: each phase moves 100 GB (50 read + 50 written). At v5 that put split at ~3.3 GB/s and merge at ~2.45 GB/s. As of v7 they run at **3.52 and 3.73 GB/s** — both now in the upper half of the band raw `dd` produces on this machine, where the merge previously sat below it. That is suggestive of being near the limit; it is not proof, and an earlier draft of this README overclaimed it as "95% of ceiling."
+
+It does, however, change what is left. The two changes that converted in v6/v7 both removed a *serialization* — reads and writes never overlapping — rather than making any single operation faster. With both phases now inside the mixed-I/O band, there is no comparable structural win the measurements point at.
 
 The stronger evidence is behavioral. Four optimizations were implemented and measured, and **exactly one produced a speedup:**
 
@@ -323,6 +332,41 @@ There is also a cheap internal invariant that runs before any I/O: the cut table
 
 ---
 
+## What was tried
+
+Thirteen changes. **Three converted to wall clock.** The rest are here because
+the failures were more informative than the wins.
+
+| change | CPU | wall | outcome |
+|---|---|---|---|
+| merge `ifstream` → `pread` | ~0 | **−11s** | shipped |
+| decoupled merge writer | — | **−4.6s** | shipped |
+| decoupled split writer | — | unattributed | shipped |
+| parallelize sampling + cut table | ~0 | −3.5s claimed | shipped, never isolated |
+| split `ofstream` → `pwrite` | −83s sys | 0 | shipped anyway |
+| 52 MB output buffer, no writer | −23s | 0 | knob, left off |
+| 52 MB output buffer, with writer | — | **+8.9s** | rejected |
+| `F_NOCACHE` on output | −13s sys | +4s | reverted |
+| `F_RDADVISE` prefetch hint | 0 | 0 | reverted |
+| `BUFRECS` 16384 / 32768 | 0 | 0 | rejected |
+| `F_PREALLOCATE` | −1.2s sys | 0 | rejected |
+| fused split+merge, 12 GB resident | — | **+14s** | rejected |
+| threaded read prefetch, 1-deep | — | **+11s** | rejected |
+
+**The rule that held every time: a change converts only when it removes
+serialized work from the critical path.** All three winners did. Six changes
+removed real CPU time from a CPU that was already idle and bought nothing —
+including one that cut 25% of user time for exactly zero seconds.
+
+Two entries are worth reading as warnings rather than results. The 52 MB output
+buffer *reversed sign* depending on context: neutral alone, actively harmful
+once a writer thread existed, because coarse handoffs starve the writer between
+bursts. And the 1-deep read prefetch failed on a device that a `dd` test had
+already shown gains only 21% from 8× the queue depth — the evidence was there
+before the experiment was written.
+
+---
+
 ## Methodology notes
 
 Several of these cost real time to learn and changed conclusions.
@@ -335,7 +379,7 @@ Several of these cost real time to learn and changed conclusions.
 
 **Medians hide small wins when variance is wide.** Split's `pwrite` change looked like a wash on medians (34.7s vs 35.3s) — but the three fastest split runs ever recorded were all `pwrite` runs, and the minimums differed by 6 seconds. With a 7–12s spread, three samples is not enough to call a null result.
 
-**One sample is not a measurement, including when it's the one you're measuring against.** The `dd` ceiling used to justify "we're done" was a single run. Repeating it gave 2.73, 3.69 and 4.34 GB/s — the number this project's stopping criterion rested on had a 60% spread. The behavioral evidence (four CPU optimizations, zero speedups) turned out to be far more reliable than the direct measurement.
+**One sample is not a measurement, including when it's the one you're measuring against.** The `dd` ceiling used to justify "we're done" was a single run. Repeating it gave 2.73, 3.69 and 4.34 GB/s — the number this project's stopping criterion rested on had a 60% spread. The behavioral evidence (six CPU optimizations, zero speedups) turned out to be far more reliable than the direct measurement.
 
 **Hypotheses that were tested and refuted.** Threading was predicted to help *less* under real disk I/O; it helps *more*, because I/O wait is exactly what parallelism hides. Split's rising system time was attributed to memory pressure; using *less* buffer memory made it worse, because smaller buffers meant smaller chunks meant more files — the causation was backwards. Fewer runs were predicted to speed the merge; no change. Bypassing the page cache was predicted to help; it lost.
 
@@ -343,7 +387,13 @@ Several of these cost real time to learn and changed conclusions.
 
 ## Current limits
 
-Both phases run inside the throughput band raw `dd` produces on this machine. `user` time is flat and small in both, and four separate CPU optimizations produced no wall-clock gain. The remaining work is bounded by hardware, not code.
+Both phases now run at 3.5–3.7 GB/s mixed, inside the band raw `dd` produces on this machine. `user` time is flat and small in both, and six separate CPU optimizations produced no wall-clock gain — while all three changes that *did* convert removed a serialization rather than making any operation faster. That pattern is the strongest evidence available that what remains is bounded by the device. It is still an inference: the `dd` band spans 60%, so there is no trustworthy ceiling to measure against.
+
+Two limits on the result itself, both worth stating plainly:
+
+**The dataset is only ~1.3× RAM** (47 GB against 36 GiB). That makes this a mild external sort — the regime where buffer allocation and merge fan-in genuinely bite is many multiples of memory, and none of that pressure appears here. A run at 4–8× RAM would test the design far harder.
+
+**There is no external baseline.** Every multiple in this README is measured against this project's own v1, which is self-relative. A GNU `sort` comparison on identical input, same thread count, reporting both wall clock and CPU-seconds, is the missing number — until it exists, "is 55s good for this hardware?" is unanswered.
 
 ## Possible next steps
 
