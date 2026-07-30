@@ -182,7 +182,7 @@ Earlier versions in this table were measured warm and are therefore slightly fla
 Three of the five steps had nothing to do with the algorithm:
 
 - **v1 → v2** killed the value log. Sorting key+pointer pairs and chasing pointers meant random reads across the value file during the merge. Storing full records in sorted runs made every read sequential.
-- **v2 → v3** was one idea: read ~800 KB at a time instead of 100 bytes. The old merge issued ~6.1M read syscalls at ~60 µs each ≈ 380s of pure latency, matching the 384s of measured I/O wait almost exactly. **Worth 3.27× — more than threading.**
+- **v2 → v3** was one idea: read ~800 KB at a time instead of 100 bytes. The old merge issued ~6.1M read syscalls, and 384s of I/O wait was measured. That implies ~63 µs per call, which is the right order for a small buffered read — so essentially all of that time was syscall latency, not transfer. **Worth 3.27× — more than threading.**
 - **v4 → v5** removed `iostream` from both hot paths. See below.
 
 ---
@@ -232,7 +232,7 @@ Raw device throughput, measured with `dd` to give the sort's numbers a reference
 
 For scale: each phase moves 100 GB (50 read + 50 written). At v5 that put split at ~3.3 GB/s and merge at ~2.45 GB/s. Under controlled conditions they now run at **4.97 and 3.54 GB/s** — and the split is *above* the top of the band in the table above. That does not mean the sort beat the hardware; it means these `dd` samples were taken at unknown disk utilization and are not a ceiling. An earlier draft of this section overclaimed "95% of ceiling," and a later one claimed the remaining work was hardware-bound. Both rested on this table.
 
-It does, however, change what is left. The two changes that converted in v6/v7 both removed a *serialization* — reads and writes never overlapping — rather than making any single operation faster. With both phases now inside the mixed-I/O band, there is no comparable structural win the measurements point at.
+It does, however, change what is left. The two changes that converted both removed a *serialization* — reads and writes never overlapping — rather than making any single operation faster. No comparable serialization remains in either phase, which is a statement about what has been measured, not a claim that the hardware is saturated.
 
 The stronger evidence is behavioral. Four optimizations were implemented and measured, and **exactly one produced a speedup:**
 
@@ -243,7 +243,9 @@ The stronger evidence is behavioral. Four optimizations were implemented and mea
 | `F_NOCACHE` on output (page-cache bypass) | −13s sys | none (slightly worse) |
 | inlined `uint64` key compare vs `memcmp` | −7.8s user | none |
 
-The pattern is consistent: **below the disk ceiling, CPU work costs time; at the ceiling, it costs nothing.** The `pread` fix landed while the merge was at 71% of ceiling and had room. Everything attempted afterward produced real, verified, reproducible CPU savings and zero speedup.
+The pattern is consistent: **when the phase has I/O headroom, CPU work costs time; when it does not, CPU work is free.** Everything attempted after the `pread` fix produced real, verified, reproducible CPU savings and zero speedup.
+
+The original phrasing here was "below the disk ceiling / at the ceiling," and quoted the merge as being at 71% of ceiling. Both rested on the `dd` table above, which later turned out not to be a usable ceiling. The empirical pattern survives; the explanation in terms of a known hardware limit does not.
 
 Two of those are worth keeping anyway — `pwrite` frees 83 CPU-seconds, which matters when anything else is running. Two were reverted:
 
@@ -253,6 +255,14 @@ Two of those are worth keeping anyway — `pwrite` frees 83 CPU-seconds, which m
 ---
 
 ## Detailed results
+
+**These are v4-era measurements, kept for the reasoning rather than the numbers.**
+They predate the `pread` fix, the parallel merge setup, the output writer, and the
+environmental protocol — so disk fullness and pending writeback were uncontrolled,
+which later turned out to be worth up to 2×. Current figures are split **20.1s**
+and merge **28.2s**, against the 32.0s and 51.3s below. Whether the *scaling
+shape* still holds has not been retested, and there is reason to think it
+changed: the merge now runs at 241% CPU where these tables top out at 131%.
 
 ### Merge — thread scaling
 
@@ -266,7 +276,9 @@ Medians of 3 round-robin cycles at 47 GB, 100 runs (v4 code).
 | 8 | 52.1s | 2.95× | 31.5s | 38.5s | 134% | 1.92 GB/s |
 | **10** | **51.3s** | **3.00×** | 31.6s | 35.6s | 131% | **1.95 GB/s** |
 
-`user` time is flat at ~30s across every thread count. The threads add no computation — they reclaim I/O wait. Throughput triples because an NVMe SSD needs multiple outstanding requests to reach its bandwidth; one thread issuing sequential reads leaves the device mostly idle.
+`user` time is flat at ~30s across every thread count. The threads add no computation — they reclaim I/O wait.
+
+An earlier draft explained the 3× as an NVMe needing multiple outstanding requests to reach bandwidth. That holds for v4, whose merge read in small buffered chunks. **It does not transfer to the current code:** an 800 KB read is ~114 µs of pure transfer at 7 GB/s, so a single stream nearly saturates the device, and an 8-way `dd` gained only 21% over one. Queue depth was the v4 bottleneck. It is not the current one, and a later attempt to add read prefetch depth on that reasoning cost 11 seconds.
 
 ### Split — thread scaling
 
@@ -314,6 +326,8 @@ Merge at P=10, 5 GB dataset, varying records buffered per stream.
 
 Cold, 256 → 4096 is **3.6×**. Cached, everything from 1024 to 8192 is flat within noise. The right value depends entirely on whether the data fits in RAM. At 47 GB with `pread`, 8192 measured best; 2048 was clearly worse (46.8s vs 38.7s).
 
+The 47 GB verdicts for 16384 and 32768 were "no difference," but they were reached against a ±6s noise floor that the environmental protocol later reduced to ±3.7s. Worth retesting — the merge now spends 35s in the kernel against the split's 15s, which is exactly what a larger read buffer would attack.
+
 ### Creating files costs more than overwriting them
 
 Split at T=8, identical except whether `run*.dat` already existed:
@@ -336,7 +350,9 @@ This also explains the chunk-size sweep, where every run deleted its output firs
 
 Fitting those three points gives **sys ≈ 115s + 0.59s × (number of files)**. Two predictions fall out, both confirmed against data the fit never saw: per-file cost ~0.6s (measured 0.64s above), and a fixed component equal to the overwrite case's system time (measured 119.6s against a predicted 115s).
 
-The mechanism is filesystem metadata contention between concurrent writers. The serial split barely notices create-vs-overwrite (87.3s vs 85.5s, 2%) because it writes one file at a time.
+The mechanism was read as filesystem metadata contention between concurrent writers. The serial split barely notices create-vs-overwrite (87.3s vs 85.5s, 2%) because it writes one file at a time.
+
+**This was the first sighting of what later turned out to be the largest effect in the project, and the explanation above is incomplete.** The same phenomenon, measured much later at 47 GB: run files written fresh into a 75%-full volume merged in 45.6s, against 24.4s for files that had been overwritten in place twenty times. That is 2×, against the 7s seen here. Metadata contention is part of it, but extent allocation out of fragmented free space is doing at least as much work — and it scales with how full the disk is, which nothing in this section controlled for. See [The environment mattered more than the code](#the-environment-mattered-more-than-the-code).
 
 ### Run count does not matter
 
@@ -469,7 +485,7 @@ the volume was.
 
 **Controlling the environment does not just lower the number, it makes
 measurement possible.** Variance collapsed from ±6s to ±3.7s on the total and
-±0.4s on the split, which is a fivefold improvement and enough to resolve a
+±0.34s on the split, which is a fivefold improvement and enough to resolve a
 1–2s effect. Every "0 wall" verdict below was reached against a ±6s noise
 floor and **needs retesting**: `BUFRECS` 16384/32768, `F_PREALLOCATE`,
 `F_RDADVISE`, and the never-measured `fsync` handoff fix.
@@ -515,7 +531,7 @@ the failures were more informative than the wins.
 **The rule that held every time: a change converts only when it removes
 serialized work from the critical path.** Both winners did. Of the other eleven:
 six bought nothing, four actively made things worse, and one has never been
-isolated. Most of the six removed real CPU time from a CPU that was already
+isolated. Three of the six removed real CPU time from a CPU that was already
 idle —
 including one that cut 25% of user time for exactly zero seconds.
 
@@ -562,7 +578,7 @@ At 49% disk utilization the split moves 100 GB in 20.1s — **4.97 GB/s mixed re
 
 So the honest position is that **this project does not know where the device limit is.** An earlier draft of this section claimed the remaining work was bounded by hardware; that claim rested entirely on the `dd` band, and the band turned out to be subject to the same confound as the thing it was measuring. Re-running it at a known disk utilization is an open item.
 
-What is still true: `user` time is flat and small in both phases, seven CPU-side changes produced no wall-clock gain, and both changes that did convert removed a serialization rather than making any operation faster. What is new is a visible target — the merge is now the slower phase by a clear margin, 3.54 GB/s against the split's 4.97, and it burns 35s of system time against the split's 15s. That points at syscall volume from 1000 concurrent streams, not at compute.
+What is still true: `user` time is flat and small in both phases, the three CPU-side changes that produced real CPU savings produced no wall-clock gain at all, and both changes that did convert removed a serialization rather than making any operation faster. What is new is a visible target — the merge is now the slower phase by a clear margin, 3.54 GB/s against the split's 4.97, and it burns 35s of system time against the split's 15s. That points at syscall volume from 1000 concurrent streams, not at compute.
 
 Two limits on the result itself, both worth stating plainly:
 
@@ -577,6 +593,5 @@ Two limits on the result itself, both worth stating plainly:
 - **Attack the merge's 35s of system time.** It is now the slower phase (3.54 GB/s vs the split's 4.97) and its kernel time is more than double the split's, which suggests syscall volume from 1000 concurrent streams. Larger `BUFRECS` and page-aligned direct I/O both target it
 - Measure the parallel sampling + cut table, which has never been isolated. The v5 merge median of 40.8s against v6's `nbuf=1` median of 29.82s hints it is worth far more than the 3.5s claimed — but that is a cross-session comparison, which this project's own test discipline rules inadmissible
 - Benchmark against nsort and ELSAR, the single-node sorters that actually hold Sort Benchmark entries. GNU `sort` is done (5.9×) but it is the weakest of the three, and it is CPU-bound here rather than I/O-bound, so it does not probe the same limits this code runs into
-- Repeat the `dd` ceiling test enough times to get a trustworthy number — the current three samples span 60%
 - A loser tree instead of `priority_queue` — halves comparisons, though the evidence says it would not convert to wall clock at this scale
 - Confirm the parallel sampling and cut table actually convert to wall clock. Both are now parallel over runs, and the output is byte-identical (`valsort ee6b6a9da7427ce`, 0 duplicate keys at 47 GB) — but the ~3.5s that motivated the change was measured on a scratchpad build and has never been confirmed against the shipped binary. It needs `purge` before *every* merge: an end-to-end run reads run files the split just wrote, so it is partially warm, and the 5 GB set cannot see the change at all, because at that size the runs fit in page cache and the read latency it removes does not exist. Given that six of ten changes here removed real CPU and bought zero seconds, this one is unproven until measured that way.
