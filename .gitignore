@@ -18,10 +18,14 @@ input.txt
 # mac files
 .DS_Store
 .metadata_never_index
-experiments/merge_v10
-experiments/merge_v10_tsan
+
+# scratch datasets and outputs
 tiny/
-HANDOFF.md
-gnu_out.dat
-ascii/
 atiny/
+ascii/
+gnu_out.dat
+
+# local only: working notes and scratch versions
+HANDOFF.md
+OPTIMIZATION_LOG.md
+experiments/

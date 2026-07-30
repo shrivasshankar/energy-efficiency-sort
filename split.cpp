@@ -1,7 +1,7 @@
 // Chunks are written inline by the thread that sorted them.
 //
-// A writer thread was tried here (experiments/split_v2.cpp) and it's a null
-// result -- three interleaved cold cycles gave +9.53 / -0.36 / -5.42s. The
+// A writer thread was tried here and it's a null result -- three interleaved
+// cold cycles gave +9.53 / -0.36 / -5.42s. The
 // merge had a measured serialization; this doesn't. Each thread sorts for
 // ~0.46s per 500MB chunk and writes for ~175ms, so eight threads already
 // drift out of phase enough to overlap. Don't re-add one without measuring
