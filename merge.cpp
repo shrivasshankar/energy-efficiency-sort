@@ -18,22 +18,13 @@
 
 #include <stdexcept>    // runtime_error
 
-// Output writes are handed to a per-thread writer rather than issued inline.
+// Output writes go to a per-thread writer instead of inline.
 //
-// The measurement that motivated it: no-op'ing writeFully split the merge
-// into 13.6s read+merge and 27.9s write, summing to EXACTLY the 41.5s
-// total. An exact sum means zero overlap -- a thread blocked in pwrite
-// issues no reads, and a thread blocked in pread issues no writes.
-//
-// Result, 47GB: a 3-cycle interleaved cold A/B gave -12.5% and won all
-// three pairs (-3.54 / -5.00 / -2.93s). End to end the merge went
-// 37.35s -> 32.71s, -12.4%, so the A/B held up outside the harness.
-//
-// NBUF (argv[4]) is the ring depth; NBUF=1 runs the old synchronous path
-// verbatim, so this one binary still A/Bs itself. Leave OBRECS at 8192:
-// a 52MB output buffer measured 8.9s SLOWER because coarse handoffs starve
-// the writer between bursts -- the opposite of the CPU-side reasoning that
-// originally motivated the big buffer.
+// No-op'ing writeFully split this into 13.6s of read+merge and 27.9s of write
+// -- summing to exactly the 41.5s total, so nothing overlapped. Handing the
+// buffer off recovered 12.5%. NBUF=1 runs the old synchronous path, so the
+// binary A/Bs itself. Leave OBRECS at 8192; 52MB buffers cost 8.9s because
+// coarse handoffs starve the writer.
 
 const int KS = 10;               // key size
 const int RECORD_SIZE = 100;
@@ -98,10 +89,8 @@ struct Cmp {
 typedef array<char, KS> Key;
 
 // first record index in this run whose key is STRICTLY GREATER than sp
-// Takes a shared fd rather than its own ifstream: an ifstream carries a
-// seek cursor, so it cannot be shared, which forced this whole search to
-// run one run at a time. pread carries its offset per call, so every run
-// can be probed concurrently on one descriptor.
+// Shared fd, not an ifstream -- a seek cursor can't be shared, which is what
+// pinned this to one run at a time.
 static size_t upperBoundInRun(int fd, size_t n, const char* sp) {
     size_t lo = 0, hi = n;
     char key[KS];
@@ -125,17 +114,11 @@ static bool writeFully(int fd, const char* p, size_t n, off_t off) {
     return true;
 }
 
-// A single-producer / single-consumer ring of output buffers between one
-// merge thread and its own writer thread.
-//
-// Why this is safe without any ordering guarantee: each slot carries its
-// own absolute file offset, and pwrite takes the offset per call. The
-// writer can therefore issue slots in any order and they still land in the
-// right place. There is no sequence to get wrong.
-//
-// The merger owns slot[tail] and fills it WITHOUT the lock; the writer only
-// ever touches slots in [head, head+filled). Those ranges cannot overlap
-// while filled < n, and only the merger advances tail, under the lock.
+// SPSC ring of output buffers between a merge thread and its writer.
+// Each slot carries its own file offset, so the writer can issue them in any
+// order -- no sequencing to get wrong. The merger fills slot[tail] unlocked;
+// the writer only touches [head, head+filled), which can't overlap tail while
+// filled < n.
 struct OutPipe {
     vector<vector<char>> slot;
     vector<size_t>       slen;
@@ -152,9 +135,8 @@ struct OutPipe {
     }
 };
 
-// Claim the next free slot. Returns -1 if the writer has failed -- checking
-// `failed` in the predicate is what keeps a dead writer from hanging the
-// merger forever, which is the deadlock merge_v9 had.
+// -1 if the writer died. Testing `failed` in the predicate is what stops a
+// dead writer from hanging the merger -- that was merge_v9's deadlock.
 static int acquireSlot(OutPipe& p) {
     unique_lock<mutex> lk(p.m);
     p.cvFree.wait(lk, [&]{ return p.filled < p.n || p.failed; });
@@ -197,10 +179,8 @@ int main(int argc, char** argv) {
     auto start = chrono::high_resolution_clock::now(); // start timer
     const int    P       = argc > 1 ? stoi(argv[1])
                                     : (int)thread::hardware_concurrency();
-    // Read and output buffers are sized separately. They serve opposite
-    // patterns: BUFRECS is per input stream and there are P*K of them, so
-    // it is a memory-footprint knob. OBRECS is per thread, only P of them,
-    // and it sets how large one pwrite is.
+    // BUFRECS is per input stream, P*K of them, so it's a memory knob.
+    // OBRECS is per thread and sets the pwrite size.
     const size_t BUFRECS = argc > 2 ? stoull(argv[2]) : 8192;
     const size_t OBRECS  = argc > 3 ? stoull(argv[3]) : 8192;
     // Output ring depth. 1 = the old synchronous path (the A/B baseline).
@@ -236,9 +216,7 @@ int main(int argc, char** argv) {
         total += nrec[r];
     }
 
-    // One descriptor per run, opened once here and shared by the sampler,
-    // the cut table, and the merge. All three only ever pread, so sharing
-    // is safe, and each run gets opened once instead of three times.
+    // one fd per run, shared by the sampler, cut table and merge -- all pread
     vector<int> runFd(K);
     for (int r = 0; r < K; r++) {
         runFd[r] = open(runFiles[r].c_str(), O_RDONLY);
@@ -249,11 +227,9 @@ int main(int argc, char** argv) {
     // quantiles. Oversample 32x per bucket so splitters land close to
     // the true quantiles.
     //
-    // Runs sample independently, so this fans out over threads. Serial, it
-    // was K*S dependent seek-then-read pairs at queue depth 1 -- all
-    // latency, no throughput. Samples are gathered per run and concatenated
-    // in run order below, so the sorted sample -- and therefore every
-    // splitter -- is identical to what the serial version produced.
+    // Parallel over runs -- serially this was K*S dependent seeks at queue
+    // depth 1. Samples concatenate in run order, so the splitters are the
+    // same ones the serial version picked.
     const int S = 32 * P;
     vector<vector<Key>> perRun(K);
     {
@@ -292,11 +268,7 @@ int main(int argc, char** argv) {
 
     // cut[r][j] = first record index in run r belonging to segment j.
     // Segment j of run r is records [ cut[r][j], cut[r][j+1] ).
-    //
-    // Parallel over runs, same reasoning as the sampler: K*(P-1) binary
-    // searches, every probe a blocking read that nothing overlaps. Each
-    // thread owns whole rows of `cut`, so no two threads touch the same
-    // inner vector.
+    // Parallel over runs; each thread owns whole rows, so nothing is shared.
     vector<vector<size_t>> cut(K, vector<size_t>(P + 1, 0));
     {
         atomic<size_t> nextRun{0};
@@ -350,7 +322,7 @@ int main(int argc, char** argv) {
             } else delete sg;
         }
 
-        // --- baseline path, verbatim from merge.cpp ---
+        // NBUF=1: the original synchronous path
         if (NBUF <= 1) {
             vector<char> ob;
             ob.reserve(OBRECS * RECORD_SIZE);
@@ -405,9 +377,7 @@ int main(int argc, char** argv) {
             if (sg->advance()) pq.push({ sg->front(), it.seg });
         }
 
-        // The tail buffer must be published BEFORE done, or the output is
-        // silently short by up to one buffer -- which valsort would catch,
-        // but only after a 40-second run.
+        // publish the tail BEFORE done, or the output is short one buffer
         if (ob && !ob->empty()) publishSlot(pipe, ob->size(), off);
         {
             lock_guard<mutex> lk(pipe.m);

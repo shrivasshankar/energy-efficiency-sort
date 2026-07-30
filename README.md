@@ -74,7 +74,9 @@ Both phases default to `hardware_concurrency()` if the thread count is omitted. 
 | **v4** — parallel split + sampled splitters | 34.7s | 50.9s | 85.6s | 28.4× |
 | **v5** — `pread`/`pwrite` instead of `iostream` | 30.0s | 40.8s | 70.8s | 34.3× |
 | **v6** — parallel merge setup + decoupled merge writer | 31.2s | 32.7s | 63.9s | 38.0× |
-| **v7** — decoupled split writer | **28.4s** | **26.8s** | **55.2s** | **44.0×** |
+| **v6** — binary data, 59% disk, 3 trials | 30.0s | 34.9s | 63.6s | 38.2× |
+| ~~v7~~ — decoupled split writer | — | — | — | reverted, null result |
+| **v6** — ASCII data, 49% disk, controlled, 4 trials | **20.1s** | **28.2s** | **48.3s** | **50.3×** |
 
 v1 used a 10M-record chunk (50 runs); v2 onward use 5M (100 runs).
 
@@ -117,14 +119,44 @@ merge  26.80s
 55.24s total, 47 GB, checksum ee6b6a9da7427ce, 0 duplicate keys
 ```
 
-**The first run under 60.00 seconds** — the Sort Benchmark's MinuteSort bound —
-by 4.76s, and 5.99s better than the previous best total of 61.23s.
+That run came in under 60 seconds. **It did not reproduce, and it should not be
+quoted.** Three cooled trials on an idle machine — cache purged before each,
+four minutes of cooldown between, load 1.3–2.4, **on battery power**, all
+`valsort`-verified:
 
-Two limits on that number, both important. It is **one trial**: this project has
-measured the same binary at 28.5s and 42s hours apart, so a single run is
-indicative, not a result. And it is **unattributed** — that run had both the
-split writer and a cooler machine than the 31.17s split it beat, so the depth A/B
-has not yet separated the change from the conditions.
+| cycle | split | merge | total |
+|---|---|---|---|
+| 1 | 28.62s | 34.94s | 63.56s |
+| 2 | 30.87s | 31.26s | 62.13s |
+| 3 | 30.02s | 38.05s | 68.07s |
+| **median** | **30.02s** | **34.94s** | **63.56s** |
+
+Conditions were *better* than during the 55.24s run — cooler machine, lower load
+— and every trial was slower. So 55.24s was a favorable outlier, and **63.56s is
+what this configuration produced under those conditions.** That last clause
+turned out to be the whole story.
+
+Two things fall out of that, and both matter more than the lost headline.
+
+**The merge owns the variance, not the split.** Across every measurement of it,
+the merge has ranged 23.07s to 38.05s — a 15-second, 65% spread on identical
+code — while split stays inside 2.25s. An earlier draft of this README asserted
+the opposite, on the strength of two single trials. That was the same error the
+methodology notes below warn about.
+
+**And the split writer may have bought nothing.** Split's median here is 30.02s
+against the v5 median of 30.0s from before it existed. That comparison is
+cross-session and therefore inadmissible as proof, but the change was shipped
+without attribution and now has evidence against it. The `depth=1` vs `depth=2`
+A/B is what settles it.
+
+The merge writer is the one properly established result: a 3-cycle interleaved
+cold A/B at −12.5%, winning all three pairs.
+
+**Then it turned out neither number was measuring the code.** See the next
+section: with disk fullness and pending writeback controlled, the identical
+binary produces **48.3s**. Both 55.24s and 63.56s were measurements of the
+machine's state, not of the sort.
 
 Both phases now run at 3.5–3.7 GB/s mixed against a measured 2.73–4.34 GB/s
 device band. Whatever remains is not another serialization of the kind the two
@@ -332,16 +364,128 @@ There is also a cheap internal invariant that runs before any I/O: the cut table
 
 ---
 
+## Against GNU sort
+
+The only number here that isn't self-relative. Same 47 GB ASCII file, same
+machine, same settle protocol, both timed with a trailing flush, both outputs
+verified to the identical `valsort` checksum.
+
+| | GNU sort 9.11 | this sort | ratio |
+|---|---|---|---|
+| **wall clock** (median) | 286.85s | 48.50s | **5.9×** |
+| **CPU core-seconds** | 638.8 | 127.5 | **5.0×** |
+| records / core-second | 0.78M | 3.92M | 5.0× |
+| I/O throughput | 0.70 GB/s | 4.12 GB/s | 5.9× |
+| CPU utilization | 223% | 263% | — |
+
+Four trials each. GNU sort spanned 281.10–289.21s; this sort 47.5–51.2s. The
+ratio ranges 5.5× to 6.1×.
+
+**The CPU row is the one that matters.** Utilization is comparable, so this is
+not a thread-count win — GNU sort needs five times more computation for the
+same 500M records. That is a representational difference: this sort orders
+16-byte key+index structs and moves each record once, while GNU sort parses
+lines and carries roughly 32 bytes of per-line bookkeeping for every 100-byte
+record. That overhead is also why `-S 20G` only produced 8.26 GB spill chunks.
+
+**The two are not even in the same regime.** GNU sort ran at 0.70 GB/s of I/O
+and never approached the device; this sort ran at 4.12 GB/s and is bounded by
+it. The variance signatures agree: GNU sort's `user` time is stable to 0.7%
+because it is grinding deterministic computation, while this sort's wall clock
+swings 7.6% because it is waiting on a disk whose behaviour depends on how full
+it is. Every environmental finding in the next section matters here and would
+matter to nobody running GNU sort.
+
+**What GNU sort was given:** `-S 20G` (2.5× this sort's memory footprint),
+`--parallel=10` (matching the P-core count), `LC_ALL=C` so it compares bytes
+rather than collating by locale, temp files on the same volume, and the same
+`sync`-and-settle protocol at the same disk utilization. A larger `-S` was
+deliberately avoided — 30 GB would have pushed a 36 GiB machine into swap and
+produced an unfairly bad number.
+
+**And the honest deduction:** GNU sort solves a harder problem. It handles
+arbitrary line lengths, arbitrary key fields, locales and stability. This sort
+hardcodes `RECORD_SIZE = 100` and `KS = 10`. Some of that 5× is generality this
+code does not pay for, which is the Indy-versus-Daytona distinction in
+benchmark terms.
+
+---
+
+## The environment mattered more than the code
+
+The largest single finding in this project is not an optimization. It is that
+**most of the run-to-run variation was the machine's state, and it was worth
+more than every code change combined.**
+
+Same binary, same 47 GB ASCII dataset, three conditions:
+
+| condition | split | merge | total |
+|---|---|---|---|
+| 75% disk, benchmarked 2 min after generating the input | 45.4s @ 140% cpu | 56.2s @ 117% | **101.6s** |
+| 75% disk, after `sync` + 2 min settle | 29.0s @ 214% | 51.1s @ 125% | **80.1s** |
+| 49% disk, after `sync` + 2 min settle | 20.1s @ 302% | 28.2s @ 241% | **48.3s** |
+
+```
+pending writeback     101.6 → 80.1     −21.5s
+disk fullness          80.1 → 48.3     −31.8s
+                                       ───────
+                                       −53.3s of environment
+```
+
+Against that, the two code changes that ever converted are worth **15.6s** — the
+`iostream` fix at 11s and the merge writer at 4.6s. **Disk fullness alone beat
+every optimization in this repository put together.**
+
+The CPU percentages are the mechanism, not just a correlation. User time is
+identical across every run (30–32s for the merge, ~46s for the split), so the
+work never changed — the threads were simply blocked on I/O. Utilization
+climbing from 117% to 241% is them stopping waiting.
+
+### Three things this establishes
+
+**`purge` is not sufficient to reset state.** It drops *clean* pages; it cannot
+drop dirty ones, because those still have to reach disk. Benchmarking two
+minutes after writing 47 GB means competing with your own writeback. Only
+`sync` followed by a settle period actually clears it.
+
+**Disk fullness is a first-order variable.** At 75% full, APFS free-space
+fragmentation halved effective read throughput — a merge-only run measured
+45.6s (2.20 GB/s) against 24.4s (4.10 GB/s) for the same code on
+better-laid-out files. None of this project's earlier numbers record how full
+the volume was.
+
+**Controlling the environment does not just lower the number, it makes
+measurement possible.** Variance collapsed from ±6s to ±3.7s on the total and
+±0.4s on the split, which is a fivefold improvement and enough to resolve a
+1–2s effect. Every "0 wall" verdict below was reached against a ±6s noise
+floor and **needs retesting**: `BUFRECS` 16384/32768, `F_PREALLOCATE`,
+`F_RDADVISE`, and the never-measured `fsync` handoff fix.
+
+### The protocol
+
+```bash
+cd <workdir> && rm -f run*.dat output.dat && sync && sleep 120 && sudo purge \
+  && /usr/bin/time -p sh -c '../split_program 5000000 8 && ../merge_program 10 && sync'
+```
+
+Four runs under it: totals 48.90 / 47.49 / 47.67 / 50.99s, median **48.3s**.
+The trailing `sync` costs **0.21s** including two process launches, so the
+result is not borrowed against pending writeback — the merge writes 47 GB over
+~30s at ~1.6 GB/s, comfortably under the device's 2.85 GB/s, so writeback keeps
+pace throughout.
+
+---
+
 ## What was tried
 
-Thirteen changes. **Three converted to wall clock.** The rest are here because
+Thirteen changes. **Two converted to wall clock.** The rest are here because
 the failures were more informative than the wins.
 
 | change | CPU | wall | outcome |
 |---|---|---|---|
 | merge `ifstream` → `pread` | ~0 | **−11s** | shipped |
 | decoupled merge writer | — | **−4.6s** | shipped |
-| decoupled split writer | — | unattributed | shipped |
+| decoupled split writer | — | **null** | reverted |
 | parallelize sampling + cut table | ~0 | −3.5s claimed | shipped, never isolated |
 | split `ofstream` → `pwrite` | −83s sys | 0 | shipped anyway |
 | 52 MB output buffer, no writer | −23s | 0 | knob, left off |
@@ -354,9 +498,19 @@ the failures were more informative than the wins.
 | threaded read prefetch, 1-deep | — | **+11s** | rejected |
 
 **The rule that held every time: a change converts only when it removes
-serialized work from the critical path.** All three winners did. Six changes
+serialized work from the critical path.** Both winners did. Seven changes
 removed real CPU time from a CPU that was already idle and bought nothing —
 including one that cut 25% of user time for exactly zero seconds.
+
+The sharpest confirmation of that rule is the change that failed. The decoupled
+writer bought 12.5% in the merge, where the serialization was **measured** —
+13.6s of read+merge and 27.9s of write summing to exactly the 41.5s total. The
+same writer in the split bought nothing, because the serialization there was
+only **assumed by analogy**. Each split thread spends ~0.46s sorting a 500 MB
+chunk against ~175ms writing it, so with eight threads they already drift out of
+phase; the accidental overlap was not just present but sufficient. Identical
+change, identical reasoning, opposite outcome — decided entirely by whether the
+serialization had been measured or inferred.
 
 Two entries are worth reading as warnings rather than results. The 52 MB output
 buffer *reversed sign* depending on context: neutral alone, actively harmful
@@ -387,20 +541,25 @@ Several of these cost real time to learn and changed conclusions.
 
 ## Current limits
 
-Both phases now run at 3.5–3.7 GB/s mixed, inside the band raw `dd` produces on this machine. `user` time is flat and small in both, and six separate CPU optimizations produced no wall-clock gain — while all three changes that *did* convert removed a serialization rather than making any operation faster. That pattern is the strongest evidence available that what remains is bounded by the device. It is still an inference: the `dd` band spans 60%, so there is no trustworthy ceiling to measure against.
+At 49% disk utilization the split moves 100 GB in 20.1s — **4.97 GB/s mixed read+write, above the top of the `dd` band measured for this machine** (2.73 / 3.69 / 4.34 GB/s). That is not the sort beating the hardware. It means the `dd` reference was itself taken on a disk in an unknown and probably fragmented state, and so is not a usable ceiling.
+
+So the honest position is that **this project does not know where the device limit is.** An earlier draft of this section claimed the remaining work was bounded by hardware; that claim rested entirely on the `dd` band, and the band turned out to be subject to the same confound as the thing it was measuring. Re-running it at a known disk utilization is an open item.
+
+What is still true: `user` time is flat and small in both phases, seven CPU-side changes produced no wall-clock gain, and both changes that did convert removed a serialization rather than making any operation faster. What is new is a visible target — the merge is now the slower phase by a clear margin, 3.54 GB/s against the split's 4.97, and it burns 35s of system time against the split's 15s. That points at syscall volume from 1000 concurrent streams, not at compute.
 
 Two limits on the result itself, both worth stating plainly:
 
 **The dataset is only ~1.3× RAM** (47 GB against 36 GiB). That makes this a mild external sort — the regime where buffer allocation and merge fan-in genuinely bite is many multiples of memory, and none of that pressure appears here. A run at 4–8× RAM would test the design far harder.
 
-**There is no external baseline.** Every multiple in this README is measured against this project's own v1, which is self-relative. A GNU `sort` comparison on identical input, same thread count, reporting both wall clock and CPU-seconds, is the missing number — until it exists, "is 55s good for this hardware?" is unanswered.
+**The external baseline is GNU `sort`, and it is 5.9× slower** — see the section below. Every other multiple in this README is self-relative, measured against this project's own v1, and should be read as such.
 
 ## Possible next steps
 
-- Reproduce the 55.24s total two more times on an idle machine. One run under 60s is not a sub-60 sort; three cold trials make it a claim
-- A/B the split writer at `depth=1` vs `depth=2` to attribute the gain, since the 55.24s run changed the code and the machine temperature at the same time
+- **Re-measure the `dd` ceiling at a known disk utilization.** The current band is unusable as a reference — the split already exceeds its top — so the question of how much headroom remains is genuinely open again
+- **Retest every "0 wall" null under the controlled protocol.** They were all judged against a ±6s noise floor that is now ±3.7s: `BUFRECS` 16384/32768, `F_PREALLOCATE`, `F_RDADVISE`, and the `fsync` handoff fix in `experiments/split_v3.cpp`, which was built but never measured
+- **Attack the merge's 35s of system time.** It is now the slower phase (3.54 GB/s vs the split's 4.97) and its kernel time is more than double the split's, which suggests syscall volume from 1000 concurrent streams. Larger `BUFRECS` and page-aligned direct I/O both target it
 - Measure the parallel sampling + cut table, which has never been isolated. The v5 merge median of 40.8s against v6's `nbuf=1` median of 29.82s hints it is worth far more than the 3.5s claimed — but that is a cross-session comparison, which this project's own test discipline rules inadmissible
-- Benchmark against GNU `sort` and the Sort Benchmark reference implementations, for an external anchor rather than self-relative numbers
+- Benchmark against nsort and ELSAR, the single-node sorters that actually hold Sort Benchmark entries. GNU `sort` is done (5.9×) but it is the weakest of the three, and it is CPU-bound here rather than I/O-bound, so it does not probe the same limits this code runs into
 - Repeat the `dd` ceiling test enough times to get a trustworthy number — the current three samples span 60%
 - A loser tree instead of `priority_queue` — halves comparisons, though the evidence says it would not convert to wall clock at this scale
 - Confirm the parallel sampling and cut table actually convert to wall clock. Both are now parallel over runs, and the output is byte-identical (`valsort ee6b6a9da7427ce`, 0 duplicate keys at 47 GB) — but the ~3.5s that motivated the change was measured on a scratchpad build and has never been confirmed against the shipped binary. It needs `purge` before *every* merge: an end-to-end run reads run files the split just wrote, so it is partially warm, and the 5 GB set cannot see the change at all, because at that size the runs fit in page cache and the read latency it removes does not exist. Given that six of ten changes here removed real CPU and bought zero seconds, this one is unproven until measured that way.

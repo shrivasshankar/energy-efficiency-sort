@@ -22,3 +22,6 @@ experiments/merge_v10
 experiments/merge_v10_tsan
 tiny/
 HANDOFF.md
+gnu_out.dat
+ascii/
+atiny/
