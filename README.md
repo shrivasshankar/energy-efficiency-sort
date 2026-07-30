@@ -1,6 +1,6 @@
 # External Merge Sort
 
-A multithreaded external sort in C++17 for datasets larger than memory. Sorts 500,000,000 fixed-size records (~47 GB) in **65 seconds** on a laptop, verified byte-exact with `valsort`.
+A multithreaded external sort in C++17 for datasets larger than memory. Sorts 500,000,000 fixed-size records (~47 GB) in **71 seconds** on a laptop from a cold page cache, verified byte-exact with `valsort`.
 
 Records are the standard [gensort](http://www.ordinal.com/gensort.html) format:
 
@@ -70,11 +70,15 @@ Both phases default to `hardware_concurrency()` if the thread count is omitted. 
 | **v2** — sorted runs, key+index sort | 86.4s | 503s | 9.8 min | 4.1× |
 | **v3** — buffered merge reads | 86.4s | 153.6s | 4.0 min | 10.1× |
 | **v4** — parallel split + sampled splitters | 34.7s | 50.9s | 85.6s | 28.4× |
-| **v5** — `pread`/`pwrite` instead of `iostream` | **24.8s** | **39.9s** | **64.7s** | **37.6×** |
+| **v5** — `pread`/`pwrite` instead of `iostream` | **30.0s** | **40.8s** | **70.8s** | **34.3×** |
 
-v1 used a 10M-record chunk (50 runs); v2 onward use 5M (100 runs). v4 and v5 were measured in the same session under the same conditions.
+v1 used a 10M-record chunk (50 runs); v2 onward use 5M (100 runs).
 
-**Caveat on the v5 absolute numbers:** these are warm-cache. Split's 24.8s implies 4.0 GB/s, which is above this drive's measured mixed-workload ceiling — a large part of `input.txt` was resident in RAM. A cold run lands nearer 30s / 45s. The *comparison* between v4 and v5 is sound (interleaved trials, identical conditions); the absolute figures are optimistic.
+**v5 is cold-start**: `sudo purge` before each trial, medians of 4. Individual samples were split 27.2 / 29.4 / 30.5 / 33.5 and merge 37.1 / 38.1 / 43.5 / 43.8 — a 6s spread on both, so treat single runs as indicative only.
+
+Note that only *split* is genuinely cold. The merge reads run files that split wrote seconds earlier, so they are in page cache no matter what you purge beforehand. That is not a measurement artifact — it is what happens when you actually run the pipeline, and forcing those reads cold would measure a scenario that never occurs.
+
+Earlier versions in this table were measured warm and are therefore slightly flattered; v4 measured cold would be a little above 85.6s.
 
 Three of the five steps had nothing to do with the algorithm:
 
@@ -117,17 +121,19 @@ Fixing the merge read path was worth **11 seconds (21.6%)**. Fixing the split wr
 
 ## Knowing when to stop
 
-Raw device throughput, measured with `dd` so the numbers have a reference point:
+Raw device throughput, measured with `dd` to give the sort's numbers a reference point:
 
 | | throughput |
 |---|---|
 | pure read (40 GB) | 6.19 GB/s |
 | pure write (30 GB, sync'd) | 2.85 GB/s |
-| **mixed read+write (sync'd)** | **2.73 GB/s** |
+| mixed read+write, 3 samples | 2.73 / 3.69 / 4.34 GB/s |
 
-That third figure is the one that matters — it is the same shape as what the sort does. Both phases now run within roughly 10% of it.
+**That last row is the honest one, and it is why this section does not quote a percentage.** Repeating the identical mixed test gave a 60% spread, and the `sync`'d run came out *faster* than the unsync'd one — impossible if the measurement were stable. A single `dd` sample is not a ceiling.
 
-Four optimizations were implemented and measured. **Exactly one produced a speedup:**
+For scale: the sort moves 100 GB (50 read + 50 written), so split runs at ~3.3 GB/s and merge at ~2.45 GB/s. Both sit inside the band raw `dd` produces on this machine. That is suggestive of being near the limit; it is not proof, and an earlier draft of this README overclaimed it as "95% of ceiling."
+
+The stronger evidence is behavioral. Four optimizations were implemented and measured, and **exactly one produced a speedup:**
 
 | change | CPU effect | wall effect |
 |---|---|---|
@@ -282,7 +288,7 @@ Several of these cost real time to learn and changed conclusions.
 
 **Medians hide small wins when variance is wide.** Split's `pwrite` change looked like a wash on medians (34.7s vs 35.3s) — but the three fastest split runs ever recorded were all `pwrite` runs, and the minimums differed by 6 seconds. With a 7–12s spread, three samples is not enough to call a null result.
 
-**Measure the ceiling, so you have a terminating condition.** Without the `dd` numbers there is no way to distinguish "still has headroom" from "done." With them, the merge's 71%-of-ceiling reading predicted that the `pread` fix would convert, and split's 95% reading predicted that its fix would not. Both predictions held.
+**One sample is not a measurement, including when it's the one you're measuring against.** The `dd` ceiling used to justify "we're done" was a single run. Repeating it gave 2.73, 3.69 and 4.34 GB/s — the number this project's stopping criterion rested on had a 60% spread. The behavioral evidence (four CPU optimizations, zero speedups) turned out to be far more reliable than the direct measurement.
 
 **Hypotheses that were tested and refuted.** Threading was predicted to help *less* under real disk I/O; it helps *more*, because I/O wait is exactly what parallelism hides. Split's rising system time was attributed to memory pressure; using *less* buffer memory made it worse, because smaller buffers meant smaller chunks meant more files — the causation was backwards. Fewer runs were predicted to speed the merge; no change. Bypassing the page cache was predicted to help; it lost.
 
@@ -290,11 +296,11 @@ Several of these cost real time to learn and changed conclusions.
 
 ## Current limits
 
-Both phases are within ~10% of the drive's measured mixed-workload throughput. `user` time is flat and small in both, and four separate CPU optimizations produced no wall-clock gain. The remaining work is bounded by hardware, not code.
+Both phases run inside the throughput band raw `dd` produces on this machine. `user` time is flat and small in both, and four separate CPU optimizations produced no wall-clock gain. The remaining work is bounded by hardware, not code.
 
 ## Possible next steps
 
 - Benchmark against GNU `sort` and the Sort Benchmark reference implementations, for an external anchor rather than self-relative numbers
-- Cold-cache measurements with `purge` between trials, to replace the warm figures above
+- Repeat the `dd` ceiling test enough times to get a trustworthy number — the current three samples span 60%
 - A loser tree instead of `priority_queue` — halves comparisons, though the evidence says it would not convert to wall clock at this scale
 - Parallelize the cut table across runs — trivially parallel, and the only serial step that scales with segment count
