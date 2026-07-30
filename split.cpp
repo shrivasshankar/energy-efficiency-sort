@@ -35,6 +35,15 @@ static bool readFully(int fd, char* p, size_t n, off_t off) {
     return true;
 }
 
+static bool writeFully(int fd, const char* p, size_t n, off_t off) {
+    while (n) {
+        ssize_t w = pwrite(fd, p, n, off);
+        if (w <= 0) { perror("pwrite"); return false; }
+        p += w; n -= (size_t)w; off += w;
+    }
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     auto start = chrono::high_resolution_clock::now(); 
 
@@ -101,18 +110,21 @@ int main(int argc, char* argv[]) {
             }
 
             // one sequential write of full, sorted records
-            ofstream run("run" + to_string(c) + ".dat", ios::binary);
-            run.write(out.data(), static_cast<streamsize>(n) * RECORD_SIZE);
+            string path = "run" + to_string(c) + ".dat";
+            int rfd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (rfd < 0) { perror(path.c_str()); return; }
+            writeFully(rfd, out.data(), n * RECORD_SIZE, 0);
+            close(rfd);
         }
     };
 
-    // Spin up the threads
+    // spin up the threads
     vector<thread> pool;
     for (int t = 0; t < T; t++) {
         pool.emplace_back(worker);
     }
     
-    // Wait for all threads to finish
+    // wait for all threads to finish
     for (auto& th : pool) {
         th.join();   
     }

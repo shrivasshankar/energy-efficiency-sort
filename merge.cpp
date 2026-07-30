@@ -21,31 +21,41 @@ const int RECORD_SIZE = 100;
 namespace fs = std::filesystem;
 using namespace std;
 
+// pread() may return fewer bytes than asked for; loop until whole.
+static bool readFully(int fd, char* p, size_t n, off_t off) {
+    while (n) {
+        ssize_t r = pread(fd, p, n, off);
+        if (r <= 0) return false;
+        p += r; n -= (size_t)r; off += r;
+    }
+    return true;
+}
 
 // A bounded, buffered reader over ONE slice of ONE run file.
-// Bounded from the start: Stage A passes the whole file,
-// Stage B passes a slice. Writing it this way now avoids a rewrite.
+// Reads go straight to the kernel via pread on a shared fd. pread takes
+// its offset as an argument, so many threads can share one descriptor --
+// and one 800KB request stays one request instead of ~200 4KB round-trips.
 struct Seg {
-    ifstream in;
+    int fd;                  // shared, NOT owned -- never closed here
+    off_t off;               // my read cursor, in bytes
     vector<char> buf;
     size_t pos = 0, len = 0, cap;
     size_t remaining;        // records left in MY slice, not the file
 
-    Seg(const string& f, size_t startRec, size_t nrec, size_t bufRecs)
-        : in(f, ios::binary), buf(bufRecs * RECORD_SIZE),
-          cap(bufRecs * RECORD_SIZE), remaining(nrec) {
-        if (!in) throw runtime_error("open failed: " + f);
-        in.seekg((streamoff)startRec * RECORD_SIZE);
-    }
+    Seg(int fd_, size_t startRec, size_t nrec, size_t bufRecs)
+        : fd(fd_), off((off_t)startRec * RECORD_SIZE),
+          buf(bufRecs * RECORD_SIZE),
+          cap(bufRecs * RECORD_SIZE), remaining(nrec) {}
 
     const char* front() const { return &buf[pos]; }
 
     bool refill() {
         size_t want = min(cap, remaining * RECORD_SIZE);
         if (!want) return false;
-        in.read(buf.data(), (streamsize)want);
-        len = (size_t)in.gcount();
-        remaining -= len / RECORD_SIZE;
+        if (!readFully(fd, buf.data(), want, off)) return false;
+        off += (off_t)want;
+        len = want;
+        remaining -= want / RECORD_SIZE;
         pos = 0;
         return len >= RECORD_SIZE;
     }
@@ -126,7 +136,7 @@ int main(int argc, char** argv) {
         total += nrec[r];
     }
 
-    // Runs are ALREADY SORTED, so evenly-spaced records are that run's
+    // Runs are alr sorted, so evenly-spaced records are that run's
     // quantiles. Oversample 32x per bucket so splitters land close to
     // the true quantiles.
     const int S = 32 * P;
@@ -178,6 +188,12 @@ int main(int argc, char** argv) {
         cerr << "CUT TABLE BUG: " << acc << " vs " << total << "\n";
         return 1;
     }
+    // one descriptor per run, opened once, shared by every thread
+    vector<int> runFd(K);
+    for (int r = 0; r < K; r++) {
+        runFd[r] = open(runFiles[r].c_str(), O_RDONLY);
+        if (runFd[r] < 0) { perror(runFiles[r].c_str()); return 1; }
+    }
 
     int fd = open("output.dat", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open output.dat"); return 1; }
@@ -191,7 +207,7 @@ int main(int argc, char** argv) {
         for (int r = 0; r < K; r++) {
             size_t a = cut[r][j], b = cut[r][j + 1];
             if (b <= a) continue;          // this run has nothing here
-            Seg* sg = new Seg(runFiles[r], a, b - a, BUFRECS);
+            Seg* sg = new Seg(runFd[r], a, b - a, BUFRECS);
             if (sg->refill()) {
                 segs.push_back(sg);
                 pq.push({ sg->front(), (int)segs.size() - 1 });
@@ -206,7 +222,7 @@ int main(int argc, char** argv) {
             Item it = pq.top();
             pq.pop();
 
-            // COPY OUT FIRST: advance() may overwrite the buffer
+            // copies out first: advance() may overwrite the buffer
             // that it.rec points into.
             ob.insert(ob.end(), it.rec, it.rec + RECORD_SIZE);
             if (ob.size() >= BUFRECS * RECORD_SIZE) {
@@ -233,6 +249,7 @@ int main(int argc, char** argv) {
     for (int t = 0; t < P; t++) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
     close(fd);
+    for (int r = 0; r < K; r++) close(runFd[r]);
 
     auto end = chrono::high_resolution_clock::now();
 
