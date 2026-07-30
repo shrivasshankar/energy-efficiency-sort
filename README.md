@@ -41,6 +41,8 @@ This stays a merge sort. Samplesort contributes only its *splitter selection*, w
 3. **Offsets** — sum segment sizes to get each thread's exact starting byte in the output.
 4. **Merge** — `P` threads each run a buffered k-way merge over their key range and `pwrite` into their own region of one preallocated file.
 
+Steps 1 and 2 are themselves parallel over runs. Each run is independent, and because every probe is a `pread` — offset passed per call, no seek cursor to serialize on — all threads share one descriptor per run. Done serially these two steps were thousands of *dependent* probes at queue depth 1: all latency, no throughput.
+
 Because the runs are already sorted, the partition costs about **16,000 ten-byte probes** instead of the full read-and-write pass a real samplesort would need. That is roughly 2% of the merge, and it is the entire price of parallelism.
 
 Segments are range-disjoint and written in order, so concatenation is implicit — **there is no final merge step**.
@@ -75,6 +77,51 @@ Both phases default to `hardware_concurrency()` if the thread count is omitted. 
 v1 used a 10M-record chunk (50 runs); v2 onward use 5M (100 runs).
 
 **v5 is cold-start**: `sudo purge` before each trial, medians of 4. Individual samples were split 27.2 / 29.4 / 30.5 / 33.5 and merge 37.1 / 38.1 / 43.5 / 43.8 — a 6s spread on both, so treat single runs as indicative only.
+
+**v6 adds two changes to the merge** — parallel sampling and cut table, and a
+decoupled output writer. Measured cold end-to-end on 2026-07-30: split 31.17s,
+merge 32.73s, **63.90s total**, `valsort` checksum `ee6b6a9da7427ce`. That is a
+**single trial, not a median of 4**, so it is not directly comparable to the v5
+row above — and it came out *slower in total* than an earlier v6 run at 61.23s,
+entirely because split drew 31.17s that night against 23.86s the night before,
+on byte-identical code.
+
+The merge change itself is the part that is properly measured: a 3-cycle
+interleaved cold A/B (purge before every run, one binary switched by a single
+argument) gave **−12.5%**, winning all three pairs at −3.54 / −5.00 / −2.93s,
+and end-to-end the merge went 37.35s → 32.73s, −12.4%. It is the first change
+since the `iostream` fix to convert to wall clock.
+
+Two results worth recording from that A/B. **A 52 MB output buffer is 8.9s
+slower than 800 KB once a writer thread exists** — coarse handoffs starve the
+writer between bursts, the reverse of the CPU-side reasoning that motivated the
+big buffer. And **split, not merge, then decided the total**: it was the larger
+phase and owned a 7.3s swing on unchanged code.
+
+**v7 applies the same writer to split**, which had the identical flaw: each
+thread ran `pread` → sort → `pwrite` serialized, so overlap happened only by
+accident when eight threads drifted out of phase. Cold end-to-end on an idle
+machine, 2026-07-30:
+
+```
+split  28.44s
+merge  26.80s
+─────
+55.24s total, 47 GB, checksum ee6b6a9da7427ce, 0 duplicate keys
+```
+
+**The first run under 60.00 seconds** — the Sort Benchmark's MinuteSort bound —
+by 4.76s, and 5.99s better than the previous best total of 61.23s.
+
+Two limits on that number, both important. It is **one trial**: this project has
+measured the same binary at 28.5s and 42s hours apart, so a single run is
+indicative, not a result. And it is **unattributed** — that run had both the
+split writer and a cooler machine than the 31.17s split it beat, so the depth A/B
+has not yet separated the change from the conditions.
+
+Both phases now run at 3.5–3.7 GB/s mixed against a measured 2.73–4.34 GB/s
+device band. Whatever remains is not another serialization of the kind the two
+writer changes removed.
 
 Note that only *split* is genuinely cold. The merge reads run files that split wrote seconds earlier, so they are in page cache no matter what you purge beforehand. That is not a measurement artifact — it is what happens when you actually run the pipeline, and forcing those reads cold would measure a scenario that never occurs.
 
@@ -300,7 +347,10 @@ Both phases run inside the throughput band raw `dd` produces on this machine. `u
 
 ## Possible next steps
 
+- Reproduce the 55.24s total two more times on an idle machine. One run under 60s is not a sub-60 sort; three cold trials make it a claim
+- A/B the split writer at `depth=1` vs `depth=2` to attribute the gain, since the 55.24s run changed the code and the machine temperature at the same time
+- Measure the parallel sampling + cut table, which has never been isolated. The v5 merge median of 40.8s against v6's `nbuf=1` median of 29.82s hints it is worth far more than the 3.5s claimed — but that is a cross-session comparison, which this project's own test discipline rules inadmissible
 - Benchmark against GNU `sort` and the Sort Benchmark reference implementations, for an external anchor rather than self-relative numbers
 - Repeat the `dd` ceiling test enough times to get a trustworthy number — the current three samples span 60%
 - A loser tree instead of `priority_queue` — halves comparisons, though the evidence says it would not convert to wall clock at this scale
-- Parallelize the cut table across runs — trivially parallel, and the only serial step that scales with segment count
+- Confirm the parallel sampling and cut table actually convert to wall clock. Both are now parallel over runs, and the output is byte-identical (`valsort ee6b6a9da7427ce`, 0 duplicate keys at 47 GB) — but the ~3.5s that motivated the change was measured on a scratchpad build and has never been confirmed against the shipped binary. It needs `purge` before *every* merge: an end-to-end run reads run files the split just wrote, so it is partially warm, and the 5 GB set cannot see the change at all, because at that size the runs fit in page cache and the read latency it removes does not exist. Given that six of ten changes here removed real CPU and bought zero seconds, this one is unproven until measured that way.

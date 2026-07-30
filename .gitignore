@@ -18,3 +18,7 @@ input.txt
 # mac files
 .DS_Store
 .metadata_never_index
+experiments/merge_v10
+experiments/merge_v10_tsan
+tiny/
+HANDOFF.md

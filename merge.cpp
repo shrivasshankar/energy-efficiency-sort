@@ -10,10 +10,30 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <mutex>
+#include <condition_variable>
+#include <functional>   // ref
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <stdexcept>    // runtime_error
+
+// Output writes are handed to a per-thread writer rather than issued inline.
+//
+// The measurement that motivated it: no-op'ing writeFully split the merge
+// into 13.6s read+merge and 27.9s write, summing to EXACTLY the 41.5s
+// total. An exact sum means zero overlap -- a thread blocked in pwrite
+// issues no reads, and a thread blocked in pread issues no writes.
+//
+// Result, 47GB: a 3-cycle interleaved cold A/B gave -12.5% and won all
+// three pairs (-3.54 / -5.00 / -2.93s). End to end the merge went
+// 37.35s -> 32.71s, -12.4%, so the A/B held up outside the harness.
+//
+// NBUF (argv[4]) is the ring depth; NBUF=1 runs the old synchronous path
+// verbatim, so this one binary still A/Bs itself. Leave OBRECS at 8192:
+// a 52MB output buffer measured 8.9s SLOWER because coarse handoffs starve
+// the writer between bursts -- the opposite of the CPU-side reasoning that
+// originally motivated the big buffer.
 
 const int KS = 10;               // key size
 const int RECORD_SIZE = 100;
@@ -105,6 +125,74 @@ static bool writeFully(int fd, const char* p, size_t n, off_t off) {
     return true;
 }
 
+// A single-producer / single-consumer ring of output buffers between one
+// merge thread and its own writer thread.
+//
+// Why this is safe without any ordering guarantee: each slot carries its
+// own absolute file offset, and pwrite takes the offset per call. The
+// writer can therefore issue slots in any order and they still land in the
+// right place. There is no sequence to get wrong.
+//
+// The merger owns slot[tail] and fills it WITHOUT the lock; the writer only
+// ever touches slots in [head, head+filled). Those ranges cannot overlap
+// while filled < n, and only the merger advances tail, under the lock.
+struct OutPipe {
+    vector<vector<char>> slot;
+    vector<size_t>       slen;
+    vector<off_t>        soff;
+    const int            n;
+    int                  head = 0, tail = 0, filled = 0;
+    bool                 done = false, failed = false;
+    mutex                m;
+    condition_variable   cvFilled, cvFree;
+
+    OutPipe(int nbuf, size_t bytes)
+        : slot(nbuf), slen(nbuf, 0), soff(nbuf, 0), n(nbuf) {
+        for (auto& s : slot) s.reserve(bytes);
+    }
+};
+
+// Claim the next free slot. Returns -1 if the writer has failed -- checking
+// `failed` in the predicate is what keeps a dead writer from hanging the
+// merger forever, which is the deadlock merge_v9 had.
+static int acquireSlot(OutPipe& p) {
+    unique_lock<mutex> lk(p.m);
+    p.cvFree.wait(lk, [&]{ return p.filled < p.n || p.failed; });
+    if (p.failed) return -1;
+    return p.tail;
+}
+
+static void publishSlot(OutPipe& p, size_t nbytes, off_t off) {
+    lock_guard<mutex> lk(p.m);
+    p.slen[p.tail] = nbytes;
+    p.soff[p.tail] = off;
+    p.tail = (p.tail + 1) % p.n;
+    p.filled++;
+    p.cvFilled.notify_one();
+}
+
+static void writerLoop(int fd, OutPipe& p) {
+    for (;;) {
+        int idx; size_t nbytes; off_t off;
+        {
+            unique_lock<mutex> lk(p.m);
+            p.cvFilled.wait(lk, [&]{ return p.filled > 0 || p.done; });
+            if (p.filled == 0) return;      // done AND drained -- the only exit
+            idx = p.head; nbytes = p.slen[idx]; off = p.soff[idx];
+        }
+        bool ok = writeFully(fd, p.slot[idx].data(), nbytes, off);
+        {
+            lock_guard<mutex> lk(p.m);
+            p.slot[idx].clear();            // keeps capacity; no realloc later
+            p.head = (p.head + 1) % p.n;
+            p.filled--;
+            if (!ok) p.failed = true;
+            p.cvFree.notify_one();          // notify BEFORE bailing out
+        }
+        if (!ok) return;
+    }
+}
+
 int main(int argc, char** argv) {
     auto start = chrono::high_resolution_clock::now(); // start timer
     const int    P       = argc > 1 ? stoi(argv[1])
@@ -115,6 +203,10 @@ int main(int argc, char** argv) {
     // and it sets how large one pwrite is.
     const size_t BUFRECS = argc > 2 ? stoull(argv[2]) : 8192;
     const size_t OBRECS  = argc > 3 ? stoull(argv[3]) : 8192;
+    // Output ring depth. 1 = the old synchronous path (the A/B baseline).
+    // Memory cost is P * NBUF * OBRECS * RECORD_SIZE, so raising OBRECS and
+    // NBUF together multiplies -- 10 threads x 3 x 52MB is 1.57GB.
+    const int    NBUF    = argc > 4 ? stoi(argv[4])   : 3;
     vector<string> runFiles;
  
 
@@ -258,27 +350,71 @@ int main(int argc, char** argv) {
             } else delete sg;
         }
 
-        vector<char> ob;
-        ob.reserve(OBRECS * RECORD_SIZE);
-        off_t off = (off_t)outOff[j];
+        // --- baseline path, verbatim from merge.cpp ---
+        if (NBUF <= 1) {
+            vector<char> ob;
+            ob.reserve(OBRECS * RECORD_SIZE);
+            off_t off = (off_t)outOff[j];
 
-        while (!pq.empty()) {
+            while (!pq.empty()) {
+                Item it = pq.top();
+                pq.pop();
+
+                // copies out first: advance() may overwrite the buffer
+                // that it.rec points into.
+                ob.insert(ob.end(), it.rec, it.rec + RECORD_SIZE);
+                if (ob.size() >= OBRECS * RECORD_SIZE) {
+                    if (!writeFully(fd, ob.data(), ob.size(), off)) return;
+                    off += ob.size();
+                    ob.clear();
+                }
+
+                Seg* sg = segs[it.seg];
+                if (sg->advance()) pq.push({ sg->front(), it.seg });
+            }
+            if (!ob.empty()) writeFully(fd, ob.data(), ob.size(), off);
+
+            for (Seg* x : segs) delete x;
+            return;
+        }
+
+        // --- pipelined path: fill a slot, hand it off, keep merging ---
+        OutPipe pipe(NBUF, OBRECS * RECORD_SIZE);
+        thread  writer(writerLoop, fd, ref(pipe));
+
+        off_t off = (off_t)outOff[j];
+        int   idx = acquireSlot(pipe);
+        vector<char>* ob = idx >= 0 ? &pipe.slot[idx] : nullptr;
+
+        while (ob && !pq.empty()) {
             Item it = pq.top();
             pq.pop();
 
             // copies out first: advance() may overwrite the buffer
             // that it.rec points into.
-            ob.insert(ob.end(), it.rec, it.rec + RECORD_SIZE);
-            if (ob.size() >= OBRECS * RECORD_SIZE) {
-                if (!writeFully(fd, ob.data(), ob.size(), off)) return;
-                off += ob.size();
-                ob.clear();
+            ob->insert(ob->end(), it.rec, it.rec + RECORD_SIZE);
+            if (ob->size() >= OBRECS * RECORD_SIZE) {
+                size_t nbytes = ob->size();
+                publishSlot(pipe, nbytes, off);   // buffer is the writer's now
+                off += nbytes;
+                idx = acquireSlot(pipe);          // -1 means the writer died
+                ob  = idx >= 0 ? &pipe.slot[idx] : nullptr;
             }
 
             Seg* sg = segs[it.seg];
             if (sg->advance()) pq.push({ sg->front(), it.seg });
         }
-        if (!ob.empty()) writeFully(fd, ob.data(), ob.size(), off);
+
+        // The tail buffer must be published BEFORE done, or the output is
+        // silently short by up to one buffer -- which valsort would catch,
+        // but only after a 40-second run.
+        if (ob && !ob->empty()) publishSlot(pipe, ob->size(), off);
+        {
+            lock_guard<mutex> lk(pipe.m);
+            pipe.done = true;
+            pipe.cvFilled.notify_one();
+        }
+        writer.join();
 
         for (Seg* x : segs) delete x;
     };
@@ -301,7 +437,7 @@ int main(int argc, char** argv) {
 
     cout << "Merge time: " << elapsed.count() << " seconds"
         << "  [threads=" << P << " runs=" << K
-        << " obKB=" << (OBRECS * RECORD_SIZE / 1024)
+        << " obKB=" << (OBRECS * RECORD_SIZE / 1024) << " nbuf=" << NBUF
         << " balance min=" << *min_element(segRec.begin(), segRec.end())
         << " max="        << *max_element(segRec.begin(), segRec.end())
         << " ideal="      << total / P << "]\n";
