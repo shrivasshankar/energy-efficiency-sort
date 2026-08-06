@@ -34,3 +34,6 @@ experiments/
 *.csv
 __pycache__/
 *.pyc
+
+# raw measurement output
+*.log
