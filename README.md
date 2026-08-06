@@ -75,36 +75,51 @@ Low Power Mode was on throughout. **The 42% is methodology alone.**
 ### The 100 GB row is withdrawn
 
 The previous 100 GB figure (2,842 J, 351,911 records/joule) was taken with the
-superseded method and is not comparable to the number above. Re-measure it
-with the same protocol before drawing any conclusion from the pair.
+superseded method and is not comparable to the number above. The scaling
+question it was being used to answer has since been measured directly at
+25 vs 47 GB, so re-running it is now a third point and a fan-in probe rather
+than the thing everything waits on.
 
-### Scaling: superseded, kept for the reasoning
+### Scaling: measured at 4.2% per doubling
 
-**This section rests on the two withdrawn rows and no longer stands.** Both
-came from the looped-power method and only the 47 GB one has been redone. The
-mechanism arguments below — that fullness is a controllable variable, and that
-the merge scaled linearly while the split did not — are still worth reading.
-The arithmetic is not.
+2.5×10⁸ against 5×10⁸ records is exactly one doubling, measured as three
+**interleaved** cycles — the sizes alternate rather than running in blocks, so
+thermal state and disk condition cannot load onto whichever went second. Full
+sort each time, not split only, because run count goes 50 → 100 and merge
+fan-in is the likeliest place a penalty hides.
 
-Doubling the data cost **15% of records/joule** (414,911 → 351,911). Extrapolated
-naively, 100 GB gives 28.4 kJ per 10¹⁰ records, or ~31.3 kJ once a ~10% charger
-loss is added for a wall-side figure. But if the 15%-per-doubling trend continues
-across the 3.32 doublings from 100 GB to 1 TB:
+| cycle | 25 GB | 47 GB | 25 GB rec/J | 47 GB rec/J | slope |
+|---|---|---|---|---|---|
+| 1 | 418 J | 859 J | 598,086 | 582,072 | 2.7% |
+| 2 | 414 J | 881 J | 603,865 | 567,537 | 6.0% |
+| 3 | 415 J | 864 J | 602,410 | 578,704 | 3.9% |
 
-```
-203,630 records/joule  ->  49.1 kJ  ->  54.0 kJ wall-equivalent
-```
+**Mean 4.2% loss per doubling.** Carried across the 4.32 doublings from 5×10⁸
+to 10¹⁰ records, that projects **20.9 kJ, or 23.0 kJ wall-side** once the ~10%
+charger loss `sys_power` excludes is added back.
 
-So the honest range for a 1 TB projection is **31 kJ if the degradation stops,
-54 kJ if it continues** — and two points cannot distinguish those. A 200 GB run
-would give the third point.
+This supersedes the previous 15%-per-doubling figure, which came from comparing
+two rows both taken with the discarded looped-power method.
 
-Two reasons to think part of that 15% is recoverable:
+The 25 GB totals reproduce to **0.5%** (418 / 414 / 415 J) even though the
+individual merges are short enough to trip the under-10s warning: high
+within-run variance, very tight run-to-run totals.
 
-**Disk utilisation moved between the runs** — 50–60% for 47 GB, 55–66% for
-100 GB. Fullness is separately measured as worth **2×** on merge throughput
-between ~50% and 75%, so some of the loss is a controllable variable rather than
-inherent scaling.
+Cycle 2's 47 GB merge is an outlier — 30.3s and 468 J against 23.1s/423 J and
+23.4s/431 J, and at the *lowest* power of the three, which reads as an I/O
+stall rather than extra work. Excluding it gives 3.3%. The conclusion does not
+turn on which you take.
+
+**What this does not cover is fan-in.** The split writes 5M-record runs, so
+this compared a 50-way merge against a 100-way one. At 10¹⁰ records the same
+configuration is **2000-way**, and at `BUFRECS=8192` the read buffers alone
+want roughly `10 threads × 2000 runs × 819 KB ≈ 16 GB`. Reaching that size
+means raising records-per-run, which costs RAM for the in-memory sort, or
+cutting `BUFRECS`, which costs I/O efficiency. A slope measured across a 2×
+change in fan-in is being extrapolated across a 20× one.
+
+Two observations from the superseded runs that still hold, because their wall
+clock was always measured on cold single runs — only the power was wrong:
 
 **The merge scaled linearly; the split did not.**
 
@@ -113,11 +128,14 @@ split   x2.60 wall time for x2.0 data     but x1.99 user time
 merge   x2.12 wall time for x2.0 data
 ```
 
-The merge going linear is the good news — 200-way fan-in instead of 100-way cost
-nothing, and that was the part of the design most likely to break at scale. The
-split's extra time is all I/O, since its CPU time scaled exactly 2.0×.
+The merge going linear was the good news, since fan-in was the part of the
+design most likely to break. The split's extra time is device I/O, not
+algorithm — its CPU scaled exactly 2.0×. Throughput fell 4.14 → 3.57 GB/s
+across those two runs.
 
-Throughput fell from 4.14 to 3.57 GB/s across the same two runs.
+**Disk utilisation is a controllable variable rather than inherent scaling** —
+separately worth 2× on merge throughput between ~50% and 75% full. Though it
+bites later than expected: 50% vs 61% moved total energy by only 0.5%.
 
 ## Low Power Mode is the largest lever found
 
@@ -361,8 +379,10 @@ In priority order:
   basis before measuring: 53% of the energy is SSD, board and display, so a
   whole-system comparison is largely chassis. SoC-vs-RAPL and
   wall-meter-vs-wall-meter answer different questions.
-- **Re-measure 100 GB** with the three-cold-run protocol, so the scaling
-  question has two comparable points again.
+- **Re-measure 100 GB** with the three-cold-run protocol. Now a third scaling
+  point and a 200-way fan-in check rather than the blocker it used to be —
+  though note its ~200 GB working set puts this machine near 70% full, which
+  confounds it against the 54–59% the slope was measured at.
 - **A wall meter** for an AC-side figure. Everything here is DC-side and ~10%
   optimistic by construction.
 - **A thread-count sweep for joules**, not seconds. Still untested.
