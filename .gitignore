@@ -29,3 +29,8 @@ gnu_out.dat
 HANDOFF.md
 OPTIMIZATION_LOG.md
 experiments/
+.venv/
+
+*.csv
+__pycache__/
+*.pyc

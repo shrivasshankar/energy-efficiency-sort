@@ -1,185 +1,213 @@
 #!/usr/bin/env python3
-"""Measure whole-system energy for a command, using the battery gauge.
+"""Measure whole-system energy for a command on Apple Silicon.
 
-Why the battery and not powermetrics: powermetrics reports SoC package power
-(CPU/GPU/DRAM/ANE) and misses the SSD, display, and everything else on the
-board. Total system energy is the number that matters. On a laptop on battery,
-the battery's own current sensor measures exactly that -- every watt leaving
-the pack is a watt the machine consumed. No sudo required.
+    ./power_log.py --idle 60                      # baseline
+    ./power_log.py --records 5e8 -- ./merge_program 10
+    ./power_log.py --loop 120 --records 5e8 -- ./merge_program 10
+    ./power_log.py --csv run.csv -- ./split_program 5000000 8
 
-Two independent numbers are reported:
+Reads `macmon pipe` (brew install macmon), which exposes IOReport channels
+directly and sudolessly at 1 Hz:
 
-  1. Integrated power   -- InstantAmperage * Voltage sampled over time and
-                           trapezoid-integrated. Fine-grained, but only as
-                           good as the gauge's own refresh rate.
-  2. Coulomb counter    -- AppleRawCurrentCapacity delta (mAh) * mean voltage.
-                           Coarse (1 mAh ~= 42 J) but it is the gauge's own
-                           accounting, so it is an independent check. If these
-                           two disagree by much, distrust both.
+    sys_power    whole-system draw. The channel we want.
+    all_power    SoC only (CPU+GPU+ANE+RAM) -- what powermetrics reports.
 
-Usage:
-    ./power_log.py -- ./split_program 5000000 8 2
-    ./power_log.py --idle 20               # characterise baseline draw
-    ./power_log.py --csv run.csv -- ./merge_program 10
+Measured response: unplugged with apps closed, idle is 3.54 W of which the SoC
+is 0.20 W. Four busy `yes` loops took sys_power from ~15 W to ~30 W while
+all_power went 1.5 -> 9 W, so sys_power rises by more than the SoC does. It
+covers regulator losses, memory, storage and display, which is what a
+total-system figure has to include.
 
-Not a rigorous total-system figure on its own: a proper measurement is AC-side,
-which includes the charger conversion loss this method excludes by construction.
-Treat this as the development instrument -- it tells you whether a change moved
-joules, which is what you need day to day.
+WHY NOT THE BATTERY GAUGE. Four attempts, four failures, documented here so
+nobody repeats them:
+
+  * InstantAmperage refreshes every ~19s and is pre-filtered (FilteredCurrent
+    sits beside it in ioreg). A 28s run gets 1-2 samples. Integrating it gave
+    2 distinct values across 168 samples.
+  * AppleRawCurrentCapacity is a state-of-charge *estimate*, not a coulomb
+    ledger. Measured going UP 17 mAh while discharging. Unusable.
+  * AccumulatedBatteryPower did not tick in 60s; interval unknown.
+  * Averaging the slow readings over a 4-minute loop produced a 0.70 W sample
+    during an active merge and a 54% coefficient of variation.
+
+  The gauge is built to say "3:58 remaining" -- smooth and stable by design,
+  which is the opposite of what measuring a 30-second event needs.
+
+CROSS-CHECK. Measured in matched machine states, sys_power and the battery
+gauge agree within ~10%: 9.23 vs ~8.4 W in one state, 3.54 vs 3.74 W in
+another. An earlier note here claimed a 2x disagreement; that was an error
+from comparing readings taken in different states.
+
+STILL NOT AC-SIDE. sys_power is a DC rail figure, so it excludes charger
+conversion loss -- expect a wall meter to read roughly 10% higher. Anything
+published needs the wall reading.
+
+CONDITIONS THAT CHANGED MEASUREMENTS HERE, all of which must be recorded:
+power source (idle 7.97 W plugged vs 3.54 W unplugged), which apps are open
+(11.61 / 8.39 / 3.74 W as they were closed), and disk utilisation (worth 2x on
+merge throughput between ~50% and 75% full).
 """
 
 import argparse
-import re
+import json
 import subprocess
 import sys
 import threading
 import time
 
-IOREG = ["ioreg", "-rn", "AppleSmartBattery"]
-RE_AMP = re.compile(r'"InstantAmperage" = (\d+)')
-RE_VOLT = re.compile(r'"Voltage" = (\d+)')
-RE_CAP = re.compile(r'"AppleRawCurrentCapacity" = (\d+)')
-RE_EXT = re.compile(r'"ExternalConnected" = (Yes|No)')
 
-
-def probe():
-    """Return (watts, volts, capacity_mAh, on_ac). Raises on unparseable output."""
-    out = subprocess.run(IOREG, capture_output=True, text=True).stdout
-    m_a, m_v, m_c = RE_AMP.search(out), RE_VOLT.search(out), RE_CAP.search(out)
-    if not (m_a and m_v and m_c):
-        raise RuntimeError("could not read battery gauge from ioreg")
-
-    amp = int(m_a.group(1))
-    # ioreg prints the signed 64-bit amperage as unsigned. Discharge is
-    # negative. Must be done in exact integers -- as a float this value
-    # rounds to 2**64 and the subtraction yields zero.
-    if amp >= 2**63:
-        amp -= 2**64
-
-    volts = int(m_v.group(1)) / 1000.0
-    watts = (-amp / 1000.0) * volts           # positive while discharging
-    m_e = RE_EXT.search(out)
-    return watts, volts, int(m_c.group(1)), (m_e and m_e.group(1) == "Yes")
-
-
-def preflight():
+def start_macmon(interval_ms=500):
     try:
-        watts, volts, cap, on_ac = probe()
-    except Exception as e:
-        sys.exit(f"cannot read battery: {e}")
-
-    if on_ac:
-        sys.exit("ERROR: on AC power. The battery current sensor only measures\n"
-                 "system draw while discharging. Unplug and rerun.")
-
-    lpm = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
-    m = re.search(r"lowpowermode\s+(\d+)", lpm)
-    if m and m.group(1) != "0":
-        print("WARNING: Low Power Mode is ON -- it caps performance. "
-              "Joules and seconds will both be wrong for comparison.\n")
-
-    print(f"  baseline: {watts:.2f} W at {volts:.3f} V, {cap} mAh in pack")
-    return volts, cap
+        p = subprocess.Popen(["macmon", "pipe", "-i", str(interval_ms)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, bufsize=1)
+    except FileNotFoundError:
+        sys.exit("macmon not found. Install it:  brew install macmon")
+    return p
 
 
-class Sampler(threading.Thread):
-    def __init__(self, hz):
+class Monitor(threading.Thread):
+    """Collect (monotonic, sys_power, all_power) from macmon until stopped."""
+
+    def __init__(self, interval_ms=500):
         super().__init__(daemon=True)
-        self.interval = 1.0 / hz
+        self.proc = start_macmon(interval_ms)
+        self.rows = []
         self.stop = threading.Event()
-        self.samples = []          # (monotonic_t, watts)
 
     def run(self):
-        while not self.stop.is_set():
+        for line in self.proc.stdout:
+            if self.stop.is_set():
+                break
             try:
-                w, _, _, _ = probe()
-                self.samples.append((time.monotonic(), w))
-            except Exception:
-                pass                # a dropped sample beats a crashed run
-            self.stop.wait(self.interval)
+                d = json.loads(line)
+                self.rows.append((time.monotonic(),
+                                  float(d["sys_power"]),
+                                  float(d["all_power"])))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
 
-    def joules(self):
-        """Trapezoid-integrate the power samples."""
-        s = self.samples
-        if len(s) < 2:
-            return 0.0, 0.0, 0.0
-        total = sum((s[i + 1][0] - s[i][0]) * (s[i + 1][1] + s[i][1]) / 2.0
-                    for i in range(len(s) - 1))
-        span = s[-1][0] - s[0][0]
-        return total, (total / span if span else 0.0), max(w for _, w in s)
+    def close(self):
+        self.stop.set()
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+    def slice(self, t0, t1):
+        return [r for r in self.rows if t0 <= r[0] <= t1]
+
+
+def integrate(rows, idx):
+    """Trapezoid-integrate column idx over the row timestamps."""
+    if len(rows) < 2:
+        return 0.0, 0.0
+    total = sum((rows[i + 1][0] - rows[i][0]) * (rows[i + 1][idx] + rows[i][idx]) / 2.0
+                for i in range(len(rows) - 1))
+    span = rows[-1][0] - rows[0][0]
+    return total, span
+
+
+def report(rows, label, records=0, iters=1, idle_w=None, ref=0.0):
+    if len(rows) < 3:
+        sys.exit(f"  only {len(rows)} samples -- window too short")
+    sys_j, span = integrate(rows, 1)
+    soc_j, _ = integrate(rows, 2)
+    sysw = [r[1] for r in rows]
+    mean = sys_j / span
+
+    print(f"\n  {label}")
+    print(f"  samples          {len(rows):8d} over {span:.1f}s")
+    print(f"  sys_power        {mean:8.2f} W  (min {min(sysw):.2f}, "
+          f"max {max(sysw):.2f})")
+    print(f"  SoC only         {soc_j/span:8.2f} W  "
+          f"({100*soc_j/sys_j:.0f}% of system)")
+    print(f"  energy           {sys_j:8.0f} J")
+
+    if idle_w is not None:
+        marginal = sys_j - idle_w * span
+        print(f"  minus {idle_w:.2f} W idle  {marginal:8.0f} J   "
+              f"({100*idle_w*span/sys_j:.0f}% of the total was idle draw)")
+
+    if records:
+        per = sys_j / iters
+        if iters > 1:
+            print(f"  per iteration    {per:8.0f} J  ({iters} runs)")
+        print(f"  records/joule    {records/per:12,.0f}")
+        proj = 1e10 / (records / per) / 1000
+        print(f"  1e10 records     {proj:8.1f} kJ")
+        if ref:
+            print(f"  vs reference     {ref:8.1f} kJ   ->  {ref/proj:.2f}x")
+    return sys_j, span
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hz", type=float, default=4.0,
-                    help="sample rate; the gauge itself updates ~1Hz so more "
-                         "than ~4 buys little (default 4)")
     ap.add_argument("--idle", type=float, metavar="SECONDS",
-                    help="measure idle draw for N seconds instead of running a command")
-    ap.add_argument("--csv", metavar="FILE", help="write raw samples here")
-    ap.add_argument("cmd", nargs=argparse.REMAINDER,
-                    help="-- followed by the command to measure")
+                    help="measure baseline draw, no command")
+    ap.add_argument("--loop", type=float, default=0, metavar="SECONDS",
+                    help="repeat the command until this long has passed")
+    ap.add_argument("--records", type=float, default=0,
+                    help="records per iteration, for records/joule")
+    ap.add_argument("--idle-watts", type=float, metavar="W",
+                    help="baseline from an --idle run, to report marginal energy")
+    ap.add_argument("--interval", type=int, default=500,
+                    help="macmon sample interval in ms (default 500)")
+    ap.add_argument("--reference", type=float, default=0.0, metavar="KJ",
+                    help="a published kJ figure to compare the 1e10 "
+                         "extrapolation against")
+    ap.add_argument("--csv", metavar="FILE")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
 
-    cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
-    if not cmd and args.idle is None:
-        ap.error("give a command after -- , or use --idle SECONDS")
+    mon = Monitor(args.interval)
+    mon.start()
+    time.sleep(2.0)          # let macmon produce its first samples
 
-    v0, cap0 = preflight()
+    try:
+        if args.idle:
+            print(f"  measuring idle for {args.idle:.0f}s. Do not touch the "
+                  "machine.")
+            t0 = time.monotonic()
+            time.sleep(args.idle)
+            report(mon.slice(t0, time.monotonic()), "idle")
+            return
 
-    sampler = Sampler(args.hz)
-    t0 = time.monotonic()
-    sampler.start()
+        cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
+        if not cmd:
+            ap.error("give a command after -- , or use --idle")
 
-    rc = 0
-    if args.idle is not None:
-        print(f"  measuring idle for {args.idle}s ...")
-        time.sleep(args.idle)
-    else:
-        print(f"  running: {' '.join(cmd)}\n")
-        rc = subprocess.call(cmd)
+        print(f"  running: {' '.join(cmd)}")
+        t0, iters = time.monotonic(), 0
+        while True:
+            rc = subprocess.call(cmd, stdout=subprocess.DEVNULL)
+            iters += 1
+            if rc != 0:
+                sys.exit(f"  command failed with {rc} on iteration {iters}")
+            if time.monotonic() - t0 >= args.loop:
+                break
+        t1 = time.monotonic()
 
-    sampler.stop.set()
-    sampler.join(timeout=2.0)
-    elapsed = time.monotonic() - t0
+        # sys_power lags load by ~2s at both edges, so the rise and decay
+        # roughly cancel over a run of tens of seconds. Not true for very
+        # short commands.
+        rows = mon.slice(t0, t1)
+        if t1 - t0 < 10:
+            print("  NOTE: run under 10s. sys_power lags load by ~2s, so the "
+                  "edges do not\n  cancel and this figure is unreliable. Use "
+                  "--loop.")
+        report(rows, " ".join(cmd), args.records, iters, args.idle_watts,
+               args.reference)
 
-    _, _, cap1, _ = probe()
-    total_j, mean_w, peak_w = sampler.joules()
-
-    # Independent cross-check: the gauge's own coulomb count.
-    # mAh -> Wh -> J, using the mean of start and end voltage.
-    v1 = probe()[1]
-    coulomb_j = (cap0 - cap1) / 1000.0 * ((v0 + v1) / 2.0) * 3600.0
-
-    print(f"\n  elapsed        {elapsed:8.2f} s")
-    print(f"  mean power     {mean_w:8.2f} W   (peak {peak_w:.2f} W, "
-          f"{len(sampler.samples)} samples)")
-    print(f"  energy         {total_j:8.1f} J   <- integrated power")
-
-    # The capacity field is quantised to 1 mAh (~42 J) and the gauge refreshes
-    # on the order of tens of seconds, so over a short window it can even read
-    # negative. Measured: -1 mAh over 12s when the true drain was ~3.2 mAh.
-    # Only report it where it can actually mean something.
-    if elapsed < 120:
-        need = total_j / ((v0 + v1) / 2.0) / 3600.0 * 1000.0
-        print(f"  cross-check         --     coulomb counter needs >2min "
-              f"(window implies only {need:.0f} mAh, quantised to 1)")
-    else:
-        print(f"  cross-check    {coulomb_j:8.1f} J   <- coulomb counter "
-              f"({cap0 - cap1} mAh)")
-        if total_j > 0 and coulomb_j > 0:
-            print(f"  agreement      {100.0 * min(total_j, coulomb_j) / max(total_j, coulomb_j):7.1f} %")
-    print(f"  Wh             {total_j / 3600.0:8.4f} Wh")
-
-    if args.csv:
-        with open(args.csv, "w") as f:
-            f.write("seconds,watts\n")
-            base = sampler.samples[0][0] if sampler.samples else 0
-            for t, w in sampler.samples:
-                f.write(f"{t - base:.3f},{w:.3f}\n")
-        print(f"  samples        {args.csv}")
-
-    sys.exit(rc)
+        if args.csv:
+            with open(args.csv, "w") as f:
+                f.write("seconds,sys_power,soc_power\n")
+                for t, s, a in rows:
+                    f.write(f"{t-t0:.3f},{s:.3f},{a:.3f}\n")
+            print(f"  samples          {args.csv}")
+    finally:
+        mon.close()
 
 
 if __name__ == "__main__":
