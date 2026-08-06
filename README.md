@@ -136,11 +136,11 @@ larger than every algorithmic change in the parent repo combined, and it is a
 system setting rather than a line of code. It was already on for the headline
 figure above, which is why that figure does not move.
 
-It wins so decisively because of the shape of the metric. JouleSort scores
-records per joule at a fixed record count with no time limit, so trading wall
-clock for watts is free until platform idle draw eats the saving. Against
-2.84 W idle and 37 W under load there is a lot of room, and capping clocks buys
-far more power than it costs in time.
+It wins so decisively because of the shape of the metric. Energy at a fixed
+record count has no time limit in it, so trading wall clock for watts is free
+until platform idle draw eats the saving. Against 2.84 W idle and 37 W under
+load there is a lot of room, and capping clocks buys far more power than it
+costs in time.
 
 The reproducibility is worth noting too: `LPM on, P-cores` is the same
 configuration as the headline table, measured a day apart at different
@@ -229,7 +229,8 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
    brightness moved total energy by only 0.5%. Either marginal backlight draw
    is small at these levels and most of the 14% is the panel itself, or the 14%
    is wrong. Worth measuring as a real config rather than inheriting it from a
-   band breakdown.
+   band breakdown. It is also the like-for-like condition against any headless
+   machine, which has no panel to power at all.
 5. **Wall time**, which shrinks all three bands, but the sort is already at
    3.57 GB/s against a device that does roughly 4.
 6. **I/O volume** is 4× the data for a two-pass external sort — less fixed than
@@ -239,6 +240,28 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
    bytes moved to roughly 2.6× against an SSD that sits inside the 53% band.
    Measured on the data; untested in the sort. Note it would shift the workload
    toward CPU-bound, which changes what a cross-platform comparison compares.
+
+## The merge is half kernel time
+
+At 100 GB the merge spent **68.2s in sys against 70.2s in user** — about half
+its CPU is the kernel copying pages to service 200-way concurrent reads rather
+than merging anything. The split has the opposite profile: its CPU scaled
+exactly 2.0× with data while wall time scaled 2.60×, so the split's extra cost
+is device I/O, not kernel work.
+
+Two attacks, neither resolved:
+
+- **Larger `BUFRECS`** — fewer, bigger reads per stream. Unlike the output
+  buffer this is on the read side, where there is no writer to starve.
+- **Page-aligned direct I/O.** `F_NOCACHE` was tried *unaligned* in the parent
+  repo and measured −13s sys for +4s wall, rejected on wall clock. On an energy
+  metric that trade deserves recomputing rather than inheriting — but the
+  break-even is steep. On today's 21.9s merge, +4s means power must fall from
+  18.77 W to 15.9 W, a 15% cut in total draw or roughly half the entire SoC
+  band, and `F_NOCACHE` only touches part of it.
+
+Both figures are wall-clock verdicts from before the measurement fixes, so
+neither should be believed until re-measured in joules.
 
 ## Measuring energy on Apple Silicon
 
