@@ -21,8 +21,13 @@ separate looped one. Spread is the run-to-run standard deviation.
 | **total** | **41.5s** | | **851 J** |
 
 **587,752 records/joule.** Conditions: unplugged, all apps closed, **Low Power
-Mode on**, display dimmed to 50%, idle 2.84 W, disk 50% full, M3 Max
-(10P + 4E), 1 TB internal.
+Mode on**, display dimmed (level not recorded), idle 2.84 W, disk 50% full,
+M3 Max (10P + 4E), 1 TB internal.
+
+The unrecorded brightness turned out not to matter much: a later run of this
+same configuration at a known 50% reproduced it to **0.5%** (441.3 J vs 439.0
+on the split), which bounds the backlight's contribution at these levels far
+below what the ~14% display-off figure elsewhere in this file would suggest.
 
 ### These supersede the earlier figures, which were 42% pessimistic
 
@@ -36,9 +41,10 @@ Two errors compounded.
 **Power was measured in the wrong regime.** Energy used to be `looped power ×
 cold time`. Looping was adopted to collect more power samples, but each
 iteration inherits the previous one's writeback, so it measures a contended
-machine and reports 20–44% more power than the cold run it then multiplies.
-The assumption that both regimes draw the same watts was never tested. It does
-not hold.
+machine. The looped runs reported 25.09 W on the split and 24.85 W on the
+merge; measured properly on cold runs the same phases draw 22.40 W and
+18.77 W — **12% and 32% high**. The assumption that both regimes draw the same
+watts was never tested. It does not hold.
 
 **The power tail was discarded.** `sys_power` reports a load change about 2s
 late, so ending the window at the command's exit drops the end of its own
@@ -50,14 +56,21 @@ Three cold runs cost half the disk writes of a 120s loop, produce error bars,
 and need no assumption about regime equivalence. Run-to-run spread is 1.2% on
 split, so changes of a few percent are now resolvable.
 
-**Caveat: two things changed between the old figure and the new one.** Low
-Power Mode was off for the earlier measurement and on for this one, so the 42%
-is the methodology fix *plus* whatever Low Power Mode does, and these two
-datasets cannot separate them. The 851 J stands for the configuration named
-above; attributing the whole improvement to methodology does not. Low Power
-Mode cost about 8% of wall time on the split (18.1s → 19.6s), and whether it
-repays that in watts is untested — see below, because it may be the best lever
-here.
+**A retraction, for the record.** This section briefly carried a caveat saying
+Low Power Mode had been off for the old measurement and on for the new one,
+making the 42% a two-variable change. That was recorded on recollection, and
+the sweep below refutes it two ways.
+
+By power draw: the pre-settle run averaged 20.66 W on the split. Measured
+LPM-off draws 36.94 W and measured LPM-on draws 23.30 W. 20.66 belongs to one
+of those families and not the other.
+
+By conservation: if that run had been LPM-off, adding the tail would have to
+carry it from 374.7 J to the 642 J that LPM-off actually measures. That is
+267 J deposited in a 5-second settle window — a sustained **53 W**, when the
+highest sys_power ever observed in any run here is 38.97 W. Impossible.
+
+Low Power Mode was on throughout. **The 42% is methodology alone.**
 
 ### The 100 GB row is withdrawn
 
@@ -106,37 +119,69 @@ split's extra time is all I/O, since its CPU time scaled exactly 2.0×.
 
 Throughput fell from 4.14 to 3.57 GB/s across the same two runs.
 
-## Efficiency cores: still unanswered
+## Low Power Mode is the largest lever found
+
+A four-corner sweep of the split phase, three cold runs per corner, everything
+else held constant and brightness verified unchanged at both ends of the run:
+
+| config | energy | time | power | spread |
+|---|---|---|---|---|
+| LPM off, P-cores | 641.7 J | 17.37s | 36.94 W | ±5 (0.8%) |
+| LPM off, `-c utility` | 606.0 J | 18.43s | 32.87 W | ±13 (2.2%) |
+| **LPM on, P-cores** | **441.3 J** | 18.93s | 23.30 W | ±4 (0.9%) |
+| LPM on, `-c utility` | 447.3 J | 19.70s | 22.70 W | ±25 (5.5%) |
+
+**Low Power Mode is worth 31% of the energy for 9% more wall time.** That is
+larger than every algorithmic change in the parent repo combined, and it is a
+system setting rather than a line of code. It was already on for the headline
+figure above, which is why that figure does not move.
+
+It wins so decisively because of the shape of the metric. JouleSort scores
+records per joule at a fixed record count with no time limit, so trading wall
+clock for watts is free until platform idle draw eats the saving. Against
+2.84 W idle and 37 W under load there is a lot of room, and capping clocks buys
+far more power than it costs in time.
+
+The reproducibility is worth noting too: `LPM on, P-cores` is the same
+configuration as the headline table, measured a day apart at different
+brightness and 61% vs 50% disk fullness, and it landed within **0.5%**.
+
+## Efficiency cores: still unanswered after three attempts
 
 The M3 Max is 10 performance + 4 efficiency cores, and the sort's 8–10 threads
 all land on P-cores. Since the workload is I/O-bound at 3.57 GB/s against a
-device that does roughly 4, E-cores are the obvious candidate for the one thing
-that can win here: lower power at constant time.
+device that does roughly 4, E-cores look like the obvious lever.
 
-Two attempts, both invalid:
+Three attempts, none of which measured what they were meant to:
 
-| | split | merge | SoC power | full sort |
-|---|---|---|---|---|
-| baseline | 19.6s | 21.9s | 7.2 W | 851 J |
-| `taskpolicy -b` | 87.3s | 95.0s | 0.46 W | 1,083 J |
-| `taskpolicy -c background -d default` | 88.7s | 93.6s | 0.46 W | 1,122 J |
+| | split time | SoC power | what actually happened |
+|---|---|---|---|
+| baseline (LPM on) | 18.9s | 7.4 W | — |
+| `taskpolicy -b` | 87.3s | 0.46 W | throttled I/O, QoS never changed |
+| `-c background -d default` | 88.7s | 0.46 W | throttled I/O, wrong scope |
+| `-c utility` | 19.7s | 7.5 W | no relocation at all |
 
-Both are ~4.5× slower, and the agreement between them is the finding rather
-than the slowdown itself. A QoS probe shows `-b` calls
-`setpriority(PRIO_DARWIN_BG)` and never sets a QoS clamp at all, so it does not
-move anything onto an E-core; `-c background` does. Two unrelated mechanisms
-landing within 1.6% of each other means the cause is common to both, and
-therefore is not core placement.
+The first two are ~4.5× slower, and their agreeing with each other is the
+finding rather than the slowdown. A QoS probe shows `-b` calls
+`setpriority(PRIO_DARWIN_BG)` and never sets a QoS clamp, so it moves nothing
+onto an E-core; `-c background` does. Two unrelated mechanisms landing within
+1.6% of each other means the cause is common to both, and so is not core
+placement. It is disk throttling, which 0.46 W of SoC power confirms — four
+saturated E-cores would draw several times that, so the CPU is asleep waiting
+on I/O.
 
-It is disk throttling, and 0.46 W of SoC power confirms it — four saturated
-E-cores would draw several times that, so the CPU is asleep waiting on I/O.
-Idle draw is 46% of the run.
+`-c utility` has the opposite problem. Its time and SoC power sit within a few
+percent of the plain baseline, meaning the threads never left the P-cores:
+utility QoS is a *preference*, the machine had idle P-cores, and the scheduler
+used them.
 
-`-d default` failed to lift it because it sets `IOPOL_SCOPE_PROCESS`, while
-background QoS throttles at `IOPOL_SCOPE_DARWIN_BG` — a different scope, which
-is what `-g` controls. **The clean test is `-c utility`**, which still prefers
-E-cores but sits above the QoS threshold where Darwin throttles I/O. Not yet
-run.
+So one flag forces E-cores but strangles I/O, and the other leaves I/O alone
+but does not force E-cores. **One combination remains untried:
+`taskpolicy -c background -g default`.** `-d` sets `IOPOL_SCOPE_PROCESS`, but
+background QoS throttles at `IOPOL_SCOPE_DARWIN_BG`, and `-g` is the flag for
+that scope. If that fails too, the next step is per-thread QoS in code — noting
+that Apple Silicon exposes no CPU affinity API, so QoS is the only handle that
+exists.
 
 ## Where the joules actually go
 
@@ -150,6 +195,10 @@ so read the **shares**, not the absolute joules:
 | idle | 13.9% | platform draw at 3.54 W, present whether or not you sort |
 | SoC | 33.0% | CPU + GPU + ANE + RAM — the only band an algorithm touches |
 | rest | 53.1% | SSD, regulators, board, display backlight |
+
+The provisioning sweep corroborates the SoC share independently: 31–32% under
+Low Power Mode and 37–38% without it, against the 33.0% above. So the shares
+hold even though the absolute joules came from the superseded method.
 
 **Two thirds of the energy is not computation.** A change that halved SoC work
 would cut at most 16% of the total — and the parent repo already measured a 25%
@@ -166,20 +215,24 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
 
 ### So the levers are not algorithmic
 
-1. **Low Power Mode, the most promising and least examined.** It caps clocks
-   without touching disk policy, which is exactly where the E-core attempts
-   died. It cost ~8% wall time on the split; if it saves more than 8% of the
-   watts it is a straight win, and unlike the QoS experiments it is already
-   known to run the workload at full I/O speed. Needs a deliberate A/B with
-   nothing else changing.
-2. **Core type, untested.** The other lever that changes power at constant
-   time. Two attempts so far measured the I/O throttle instead — see above.
-2. **Thread count, untested.** Distinct from core type: `merge_program 4` gives
+1. **Low Power Mode — measured, and it is the big one.** 31% of the energy for
+   9% more wall time. It caps clocks without touching disk policy, which is
+   exactly where every E-core attempt died. Already applied to the headline
+   figure.
+2. **Core type, still untested after three attempts.** The other lever that
+   changes power at constant time — see above for why none of the three
+   actually measured it.
+3. **Thread count, untested.** Distinct from core type: `merge_program 4` gives
    four threads that macOS remains free to place on P-cores.
-3. **Display off, worth ~14%.** Server-class comparisons carry no display at all.
-4. **Wall time**, which shrinks all three bands, but the sort is already at
+4. **Display off, nominally ~14%** — but treat that with suspicion. It comes
+   from the superseded looped runs, and going from "barely visible" to 50%
+   brightness moved total energy by only 0.5%. Either marginal backlight draw
+   is small at these levels and most of the 14% is the panel itself, or the 14%
+   is wrong. Worth measuring as a real config rather than inheriting it from a
+   band breakdown.
+5. **Wall time**, which shrinks all three bands, but the sort is already at
    3.57 GB/s against a device that does roughly 4.
-5. **I/O volume** is 4× the data for a two-pass external sort — less fixed than
+6. **I/O volume** is 4× the data for a two-pass external sort — less fixed than
    it looks. gensort ASCII records are 10 random key bytes followed by ~88 bytes
    of low-entropy filler, and compress **2.63× with lz4, 3.56× with zstd -1**.
    Compressing the run files, two of the four data movements, would cut total
@@ -204,6 +257,12 @@ for i in 1 2 3; do
     ./power_log.py --records 5e8 --idle-watts 2.84 --csv merge-$i.csv -- ./merge_program 10
 done
 ```
+
+[`sweep_provisioning.sh`](sweep_provisioning.sh) runs that protocol across
+several configurations unattended, derives the win threshold from a baseline it
+measures itself, holds a `caffeinate` assertion so the display cannot sleep
+mid-protocol and shift the draw between runs, and records brightness at both
+ends so a change is caught rather than absorbed.
 
 Three cold runs, not one loop. `--interval` defaults to 1000 ms because the
 IOReport channel behind `sys_power` only updates at 1 Hz — polling at 500 ms
@@ -235,13 +294,24 @@ the opposite of what a 30-second measurement needs. `FilteredCurrent` sits besid
 
 ## Conditions that changed measurements here
 
-Every one of these silently corrupted at least one run today. Record all three:
+Every one of these has silently corrupted at least one run. Record all five:
 
 ```
+low power mode   split 642 J off  vs  441 J on                  (31%, the largest)
 power source     idle 7.97 W plugged  vs  3.54 W unplugged
 open apps        11.61 W  ->  8.39 W  ->  3.74 W as they were closed
-disk fullness    merge 45.6s at ~75% full  vs  24.4s at ~50%   (2x)
+disk fullness    merge 45.6s at ~75% full  vs  24.4s at ~50%    (2x)
+display sleep    displaysleep is 2 min and the drain wait is 2 min, so the
+                 panel can sleep for some runs and not others
 ```
+
+The last one is why the sweep script holds a `caffeinate` assertion. It is not
+convenience — without it the backlight state is a coin flip per run, and the
+backlight is watts.
+
+Brightness itself turned out to matter less than expected: "barely visible" and
+50% differ by 0.5% of total energy. It still has to be held constant, but it is
+not the lever the ~14% display-off figure implies.
 
 The protocol that makes runs comparable, inherited from the parent repo:
 
@@ -256,11 +326,13 @@ after writing tens of GB means competing with your own writeback.
 
 In priority order:
 
-- **Low Power Mode on vs off**, nothing else changing. It is currently baked
-  into the headline number without having been measured on its own, and it is
-  the likeliest win available.
-- **`taskpolicy -c utility`.** The E-core test that has not actually been run
-  yet. Everything above about core type is blocked behind it.
+- **`taskpolicy -c background -g default`.** The last untried flag combination
+  that could isolate core type from disk policy. If it fails, per-thread QoS in
+  code is the only remaining route.
+- **Confirm Low Power Mode on the merge phase.** The 31% is measured on split
+  only; merge is I/O-heavier and may not behave the same.
+- **Display fully off** as a measured config, to settle whether the inherited
+  ~14% is real.
 - **The Linux side.** The point of this fork is Apple Silicon versus x86 as a
   platform, and there is no x86 figure here measured the same way. Decide the
   basis before measuring: 53% of the energy is SSD, board and display, so a
