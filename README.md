@@ -20,8 +20,9 @@ separate looped one. Spread is the run-to-run standard deviation.
 | merge | 21.9s | 18.77 W | 412 J ± 15 (3.7%) |
 | **total** | **41.5s** | | **851 J** |
 
-**587,752 records/joule.** Conditions: unplugged, apps closed, idle 2.84 W,
-disk 50% full, M3 Max (10P + 4E), 1 TB internal.
+**587,752 records/joule.** Conditions: unplugged, all apps closed, **Low Power
+Mode on**, display dimmed to 50%, idle 2.84 W, disk 50% full, M3 Max
+(10P + 4E), 1 TB internal.
 
 ### These supersede the earlier figures, which were 42% pessimistic
 
@@ -48,6 +49,15 @@ exits, and that energy belongs to the run.
 Three cold runs cost half the disk writes of a 120s loop, produce error bars,
 and need no assumption about regime equivalence. Run-to-run spread is 1.2% on
 split, so changes of a few percent are now resolvable.
+
+**Caveat: two things changed between the old figure and the new one.** Low
+Power Mode was off for the earlier measurement and on for this one, so the 42%
+is the methodology fix *plus* whatever Low Power Mode does, and these two
+datasets cannot separate them. The 851 J stands for the configuration named
+above; attributing the whole improvement to methodology does not. Low Power
+Mode cost about 8% of wall time on the split (18.1s → 19.6s), and whether it
+repays that in watts is untested — see below, because it may be the best lever
+here.
 
 ### The 100 GB row is withdrawn
 
@@ -156,8 +166,14 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
 
 ### So the levers are not algorithmic
 
-1. **Core type, untested.** The only lever that changes power at constant time.
-   Two attempts so far measured the I/O throttle instead — see above.
+1. **Low Power Mode, the most promising and least examined.** It caps clocks
+   without touching disk policy, which is exactly where the E-core attempts
+   died. It cost ~8% wall time on the split; if it saves more than 8% of the
+   watts it is a straight win, and unlike the QoS experiments it is already
+   known to run the workload at full I/O speed. Needs a deliberate A/B with
+   nothing else changing.
+2. **Core type, untested.** The other lever that changes power at constant
+   time. Two attempts so far measured the I/O throttle instead — see above.
 2. **Thread count, untested.** Distinct from core type: `merge_program 4` gives
    four threads that macOS remains free to place on P-cores.
 3. **Display off, worth ~14%.** Server-class comparisons carry no display at all.
@@ -240,6 +256,9 @@ after writing tens of GB means competing with your own writeback.
 
 In priority order:
 
+- **Low Power Mode on vs off**, nothing else changing. It is currently baked
+  into the headline number without having been measured on its own, and it is
+  the likeliest win available.
 - **`taskpolicy -c utility`.** The E-core test that has not actually been run
   yet. Everything above about core type is blocked behind it.
 - **The Linux side.** The point of this fork is Apple Silicon versus x86 as a
