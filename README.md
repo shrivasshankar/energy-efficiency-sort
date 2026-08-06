@@ -16,9 +16,9 @@ separate looped one. Spread is the run-to-run standard deviation.
 
 | 47 GB, 5×10⁸ records | time | power | energy |
 |---|---|---|---|
-| split | 19.6s | 22.40 W | 439 J ± 5 (1.2%) |
-| merge | 21.9s | 18.77 W | 412 J ± 15 (3.7%) |
-| **total** | **41.5s** | — | **851 J** |
+| split | 19.6s | 22.40 W | 439.0 J ± 5.3 (1.2%) |
+| merge | 21.9s | 18.77 W | 411.7 J ± 15.1 (3.7%) |
+| **total** | **41.5s** | — | **850.7 J** |
 
 **587,752 records/joule.** Conditions: unplugged, all apps closed, **Low Power
 Mode on**, display dimmed (level not recorded), idle 2.84 W, disk 50% full,
@@ -32,7 +32,7 @@ changed measurements here* below.
 
 | | as published before | measured directly |
 |---|---|---|
-| 47 GB total | 1,205 J | **851 J** |
+| 47 GB total | 1,205 J | **850.7 J** |
 | records/joule | 414,911 | **587,752** |
 
 Two errors compounded.
@@ -177,15 +177,15 @@ Three attempts, none of which measured what they were meant to:
 |---|---|---|---|
 | baseline (LPM on) | 18.9s | 7.4 W | — |
 | `taskpolicy -b` | 87.3s | 0.46 W | throttled I/O, QoS never changed |
-| `-c background -d default` | 88.7s | 0.46 W | throttled I/O, wrong scope |
-| `-c utility` | 19.7s | 7.5 W | no relocation at all |
+| `-c background -d default` | 88.7s | 0.49 W | throttled I/O, wrong scope |
+| `-c utility` | 19.7s | 7.21 W | no relocation at all |
 
-The first two are ~4.5× slower, and their agreeing with each other is the
+The first two are ~4.6× slower, and their agreeing with each other is the
 finding rather than the slowdown. A QoS probe shows `-b` calls
 `setpriority(PRIO_DARWIN_BG)` and never sets a QoS clamp, so it moves nothing
 onto an E-core; `-c background` does. Two unrelated mechanisms landing within
 1.6% of each other means the cause is common to both, and so is not core
-placement. It is disk throttling, which 0.46 W of SoC power confirms — four
+placement. It is disk throttling, which under 0.5 W of SoC power confirms — four
 saturated E-cores would draw several times that, so the CPU is asleep waiting
 on I/O.
 
