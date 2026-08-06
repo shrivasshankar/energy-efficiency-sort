@@ -10,20 +10,58 @@ far**; everything below is measurement.
 
 ## Results
 
-Two dataset sizes, gensort ASCII records, `valsort`-verified. Wall clock from
-purged single runs; power from separate looped runs (looping inflates time
-because each iteration inherits the previous one's writeback, but it gives many
-more power samples). Energy is power × cold time.
+gensort ASCII records, `valsort`-verified. Every figure is three cold purged
+runs, with power measured **during** the run rather than reconstructed from a
+separate looped one. Spread is the run-to-run standard deviation.
 
-| | records | split | merge | total | energy | records/joule |
-|---|---|---|---|---|---|---|
-| 47 GB | 5×10⁸ | 20.1s @ 25.09 W | 28.2s @ 24.85 W | 48.3s | 1,205 J | 414,911 |
-| 100 GB | 1×10⁹ | 52.2s @ 26.35 W | 59.9s @ 24.49 W | 112.1s | 2,842 J | 351,911 |
+| 47 GB, 5×10⁸ records | time | power | energy |
+|---|---|---|---|
+| split | 19.6s | 22.40 W | 439 J ± 5 (1.2%) |
+| merge | 21.9s | 18.77 W | 412 J ± 15 (3.7%) |
+| **total** | **41.5s** | | **851 J** |
 
-100 GB checksum `1dcd615efb9dfe11`, 0 duplicate keys. Conditions: unplugged,
-apps closed, idle 3.54 W, disk 55% full rising to 66%.
+**587,752 records/joule.** Conditions: unplugged, apps closed, idle 2.84 W,
+disk 50% full, M3 Max (10P + 4E), 1 TB internal.
 
-### Scaling is the finding, and it is not encouraging
+### These supersede the earlier figures, which were 42% pessimistic
+
+| | as published before | measured directly |
+|---|---|---|
+| 47 GB total | 1,205 J | **851 J** |
+| records/joule | 414,911 | **587,752** |
+
+Two errors compounded.
+
+**Power was measured in the wrong regime.** Energy used to be `looped power ×
+cold time`. Looping was adopted to collect more power samples, but each
+iteration inherits the previous one's writeback, so it measures a contended
+machine and reports 20–44% more power than the cold run it then multiplies.
+The assumption that both regimes draw the same watts was never tested. It does
+not hold.
+
+**The power tail was discarded.** `sys_power` reports a load change about 2s
+late, so ending the window at the command's exit drops the end of its own
+power curve. Recovering it raised split by 17% and merge by 4% — split is
+worse because 50 GB of run-file writeback is still draining when the process
+exits, and that energy belongs to the run.
+
+Three cold runs cost half the disk writes of a 120s loop, produce error bars,
+and need no assumption about regime equivalence. Run-to-run spread is 1.2% on
+split, so changes of a few percent are now resolvable.
+
+### The 100 GB row is withdrawn
+
+The previous 100 GB figure (2,842 J, 351,911 records/joule) was taken with the
+superseded method and is not comparable to the number above. Re-measure it
+with the same protocol before drawing any conclusion from the pair.
+
+### Scaling: superseded, kept for the reasoning
+
+**This section rests on the two withdrawn rows and no longer stands.** Both
+came from the looped-power method and only the 47 GB one has been redone. The
+mechanism arguments below — that fullness is a controllable variable, and that
+the merge scaled linearly while the split did not — are still worth reading.
+The arithmetic is not.
 
 Doubling the data cost **15% of records/joule** (414,911 → 351,911). Extrapolated
 naively, 100 GB gives 28.4 kJ per 10¹⁰ records, or ~31.3 kJ once a ~10% charger
@@ -58,6 +96,38 @@ split's extra time is all I/O, since its CPU time scaled exactly 2.0×.
 
 Throughput fell from 4.14 to 3.57 GB/s across the same two runs.
 
+## Efficiency cores: still unanswered
+
+The M3 Max is 10 performance + 4 efficiency cores, and the sort's 8–10 threads
+all land on P-cores. Since the workload is I/O-bound at 3.57 GB/s against a
+device that does roughly 4, E-cores are the obvious candidate for the one thing
+that can win here: lower power at constant time.
+
+Two attempts, both invalid:
+
+| | split | merge | SoC power | full sort |
+|---|---|---|---|---|
+| baseline | 19.6s | 21.9s | 7.2 W | 851 J |
+| `taskpolicy -b` | 87.3s | 95.0s | 0.46 W | 1,083 J |
+| `taskpolicy -c background -d default` | 88.7s | 93.6s | 0.46 W | 1,122 J |
+
+Both are ~4.5× slower, and the agreement between them is the finding rather
+than the slowdown itself. A QoS probe shows `-b` calls
+`setpriority(PRIO_DARWIN_BG)` and never sets a QoS clamp at all, so it does not
+move anything onto an E-core; `-c background` does. Two unrelated mechanisms
+landing within 1.6% of each other means the cause is common to both, and
+therefore is not core placement.
+
+It is disk throttling, and 0.46 W of SoC power confirms it — four saturated
+E-cores would draw several times that, so the CPU is asleep waiting on I/O.
+Idle draw is 46% of the run.
+
+`-d default` failed to lift it because it sets `IOPOL_SCOPE_PROCESS`, while
+background QoS throttles at `IOPOL_SCOPE_DARWIN_BG` — a different scope, which
+is what `-g` controls. **The clean test is `-c utility`**, which still prefers
+E-cores but sits above the QoS threshold where Darwin throttles I/O. Not yet
+run.
+
 ## Where the joules actually go
 
 ![energy breakdown](docs/energy-100gb.png)
@@ -86,14 +156,20 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
 
 ### So the levers are not algorithmic
 
-1. **Thread count, untested.** The only lever that changes power at constant
-   time. On an I/O-bound workload fewer threads may finish in the same wall clock
-   at lower draw — invisible to every timing measurement taken so far.
-2. **Display off, worth ~14%.** Server-class comparisons carry no display at all.
-3. **Wall time**, which shrinks all three bands, but the sort is already at
+1. **Core type, untested.** The only lever that changes power at constant time.
+   Two attempts so far measured the I/O throttle instead — see above.
+2. **Thread count, untested.** Distinct from core type: `merge_program 4` gives
+   four threads that macOS remains free to place on P-cores.
+3. **Display off, worth ~14%.** Server-class comparisons carry no display at all.
+4. **Wall time**, which shrinks all three bands, but the sort is already at
    3.57 GB/s against a device that does roughly 4.
-4. **I/O volume** is structurally fixed at 4× the data for a two-pass external
-   sort. Nothing algorithmic changes that without making the sort less external.
+5. **I/O volume** is 4× the data for a two-pass external sort — less fixed than
+   it looks. gensort ASCII records are 10 random key bytes followed by ~88 bytes
+   of low-entropy filler, and compress **2.63× with lz4, 3.56× with zstd -1**.
+   Compressing the run files, two of the four data movements, would cut total
+   bytes moved to roughly 2.6× against an SSD that sits inside the 53% band.
+   Measured on the data; untested in the sort. Note it would shift the workload
+   toward CPU-bound, which changes what a cross-platform comparison compares.
 
 ## Measuring energy on Apple Silicon
 
@@ -106,10 +182,20 @@ figure.
 ```bash
 brew install macmon
 
-./power_log.py --idle 60
-./power_log.py --loop 120 --records 1e9 --idle-watts 3.54 --csv merge.csv -- ./merge_program 10
-./plot_power.py --records 1e9 --idle 3.54 split.csv merge.csv -o energy.png
+./power_log.py --idle 60          # establish the baseline first
+for i in 1 2 3; do
+    rm -f run*.dat(N); sync && sleep 120 && sudo purge
+    ./power_log.py --records 5e8 --idle-watts 2.84 --csv merge-$i.csv -- ./merge_program 10
+done
 ```
+
+Three cold runs, not one loop. `--interval` defaults to 1000 ms because the
+IOReport channel behind `sys_power` only updates at 1 Hz — polling at 500 ms
+returns every second value twice, which does not bias the integral but does
+halve the real sample count and would deflate any standard deviation computed
+from it. `--settle` defaults to 5 s and keeps sampling past the command's exit
+so the late-reported power tail lands inside the window, netting out idle draw
+across the extra seconds.
 
 `sys_power` is the whole-system channel; `all_power` is the SoC subset. Cross-check:
 in matched machine states `sys_power` agrees with the battery gauge within ~10%
@@ -152,10 +238,17 @@ after writing tens of GB means competing with your own writeback.
 
 ## Open
 
-- **A 200 GB run** for a third scaling point. It is the difference between a 31 kJ
-  and a 54 kJ projection, and nothing else resolves that.
-- **A thread-count sweep for joules**, not seconds. Untested by anyone.
-- **A wall meter** for an AC-side figure.
-- **Storage headroom.** A 1 TB sort needs ~2 TB of working set, and holding that
-  on a 2 TB drive means running at ~75% full — the regime measured at half
-  throughput. Sizing for ~50% means roughly 4 TB.
+In priority order:
+
+- **`taskpolicy -c utility`.** The E-core test that has not actually been run
+  yet. Everything above about core type is blocked behind it.
+- **The Linux side.** The point of this fork is Apple Silicon versus x86 as a
+  platform, and there is no x86 figure here measured the same way. Decide the
+  basis before measuring: 53% of the energy is SSD, board and display, so a
+  whole-system comparison is largely chassis. SoC-vs-RAPL and
+  wall-meter-vs-wall-meter answer different questions.
+- **Re-measure 100 GB** with the three-cold-run protocol, so the scaling
+  question has two comparable points again.
+- **A wall meter** for an AC-side figure. Everything here is DC-side and ~10%
+  optimistic by construction.
+- **A thread-count sweep for joules**, not seconds. Still untested.
