@@ -18,16 +18,15 @@ separate looped one. Spread is the run-to-run standard deviation.
 |---|---|---|---|
 | split | 19.6s | 22.40 W | 439 J ± 5 (1.2%) |
 | merge | 21.9s | 18.77 W | 412 J ± 15 (3.7%) |
-| **total** | **41.5s** | | **851 J** |
+| **total** | **41.5s** | — | **851 J** |
 
 **587,752 records/joule.** Conditions: unplugged, all apps closed, **Low Power
 Mode on**, display dimmed (level not recorded), idle 2.84 W, disk 50% full,
 M3 Max (10P + 4E), 1 TB internal.
 
-The unrecorded brightness turned out not to matter much: a later run of this
-same configuration at a known 50% reproduced it to **0.5%** (441.3 J vs 439.0
-on the split), which bounds the backlight's contribution at these levels far
-below what the ~14% display-off figure elsewhere in this file would suggest.
+The unrecorded brightness matters less than it looks: a later run of the same
+configuration at a known 50% reproduced this to **0.5%**. See *Conditions that
+changed measurements here* below.
 
 ### These supersede the earlier figures, which were 42% pessimistic
 
@@ -80,7 +79,7 @@ question it was being used to answer has since been measured directly at
 25 vs 47 GB, so re-running it is now a third point and a fan-in probe rather
 than the thing everything waits on.
 
-### Scaling: measured at 4.2% per doubling
+## Scaling: measured at 4.2% per doubling
 
 2.5×10⁸ against 5×10⁸ records is exactly one doubling, measured as three
 **interleaved** cycles — the sizes alternate rather than running in blocks, so
@@ -134,8 +133,10 @@ algorithm — its CPU scaled exactly 2.0×. Throughput fell 4.14 → 3.57 GB/s
 across those two runs.
 
 **Disk utilisation is a controllable variable rather than inherent scaling** —
-separately worth 2× on merge throughput between ~50% and 75% full. Though it
-bites later than expected: 50% vs 61% moved total energy by only 0.5%.
+separately worth 2× on merge throughput between ~50% and 75% full. The knee is
+higher than that range suggests, though: 50% vs 61% moved total energy by only
+0.5%, so the 2× is doing its work somewhere above 61% rather than accumulating
+steadily from 50.
 
 ## Low Power Mode is the largest lever found
 
@@ -263,9 +264,8 @@ merge   8% of samples under 15 W,  73.5% in 20-30 W
 
 At 100 GB the merge spent **68.2s in sys against 70.2s in user** — about half
 its CPU is the kernel copying pages to service 200-way concurrent reads rather
-than merging anything. The split has the opposite profile: its CPU scaled
-exactly 2.0× with data while wall time scaled 2.60×, so the split's extra cost
-is device I/O, not kernel work.
+than merging anything. The split has the opposite profile: as the scaling
+section shows, its extra time is device I/O, not kernel work.
 
 Two attacks, neither resolved:
 
@@ -299,11 +299,17 @@ for i in 1 2 3; do
 done
 ```
 
-[`sweep_provisioning.sh`](sweep_provisioning.sh) runs that protocol across
-several configurations unattended, derives the win threshold from a baseline it
-measures itself, holds a `caffeinate` assertion so the display cannot sleep
-mid-protocol and shift the draw between runs, and records brightness at both
-ends so a change is caught rather than absorbed.
+Two harnesses run that protocol unattended, both holding a `caffeinate`
+assertion so the display cannot sleep mid-protocol and shift the draw between
+runs:
+
+- [`sweep_provisioning.sh`](sweep_provisioning.sh) — sweeps several
+  configurations, derives its win threshold from a baseline it measures itself
+  rather than one carried in, and records brightness at both ends so a change
+  is caught rather than absorbed.
+- [`sweep_scaling.sh`](sweep_scaling.sh) — measures the slope by interleaving
+  two data sizes, so drift lands on both equally, and prints disk fullness
+  before every timed run.
 
 Three cold runs, not one loop. `--interval` defaults to 1000 ms because the
 IOReport channel behind `sys_power` only updates at 1 Hz — polling at 500 ms
@@ -350,9 +356,9 @@ The last one is why the sweep script holds a `caffeinate` assertion. It is not
 convenience — without it the backlight state is a coin flip per run, and the
 backlight is watts.
 
-Brightness itself turned out to matter less than expected: "barely visible" and
-50% differ by 0.5% of total energy. It still has to be held constant, but it is
-not the lever the ~14% display-off figure implies.
+Brightness itself matters less than expected — "barely visible" and 50% differ
+by 0.5% of total energy — but it still has to be held constant. See the levers
+list for why that does not settle the display-off question.
 
 The protocol that makes runs comparable, inherited from the parent repo:
 
