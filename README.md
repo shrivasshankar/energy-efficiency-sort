@@ -71,72 +71,87 @@ highest sys_power ever observed in any run here is 38.97 W. Impossible.
 
 Low Power Mode was on throughout. **The 42% is methodology alone.**
 
-### The 100 GB row is withdrawn
+## Scaling: three sizes, and the slope is not constant
 
-The previous 100 GB figure (2,842 J, 351,911 records/joule) was taken with the
-superseded method and is not comparable to the number above. The scaling
-question it was being used to answer has since been measured directly at
-25 vs 47 GB, so re-running it is now a third point and a fan-in probe rather
-than the thing everything waits on.
+Three sizes, three cold runs each, same protocol and same machine state. 25 and
+47 GB were run as **interleaved** cycles so drift could not load onto whichever
+went second; 100 GB was run separately, with the input deleted before the merge
+phase to hold peak fullness near the other two.
 
-## Scaling: measured at 4.2% per doubling
+| | 25 GB | 47 GB | 100 GB |
+|---|---|---|---|
+| Records | 2.5×10⁸ | 5×10⁸ | 10⁹ |
+| Split energy | 221 J | 427 J | 992 J |
+| Merge energy | 195 J | 441 J | 985 J |
+| **Total** | **416 J** | **868 J** | **1,977 J** |
+| **Records/joule** | **601,000** | **576,000** | **506,000** |
+| Split time | 9.5 s | 19.3 s | 60.2 s |
+| Merge time | 9.4 s | 25.6 s | 57.7 s |
+| Throughput | 5.31 GB/s | 4.46 GB/s | 3.39 GB/s |
+| Merge fan-in | 50-way | 100-way | 200-way |
+| Run-to-run spread | 0.5% | 1.3% | 4.4% |
 
-2.5×10⁸ against 5×10⁸ records is exactly one doubling, measured as three
-**interleaved** cycles — the sizes alternate rather than running in blocks, so
-thermal state and disk condition cannot load onto whichever went second. Full
-sort each time, not split only, because run count goes 50 → 100 and merge
-fan-in is the likeliest place a penalty hides.
-
-| cycle | 25 GB | 47 GB | 25 GB rec/J | 47 GB rec/J | slope |
-|---|---|---|---|---|---|
-| 1 | 418 J | 859 J | 598,086 | 582,072 | 2.7% |
-| 2 | 414 J | 881 J | 603,865 | 567,537 | 6.0% |
-| 3 | 415 J | 864 J | 602,410 | 578,704 | 3.9% |
-
-**Mean 4.2% loss per doubling.** Carried across the 4.32 doublings from 5×10⁸
-to 10¹⁰ records, that projects **20.9 kJ, or 23.0 kJ wall-side** once the ~10%
-charger loss `sys_power` excludes is added back.
-
-This supersedes the previous 15%-per-doubling figure, which came from comparing
+**The slope is 4.2% per doubling from 25 → 47 GB, and 12.2% from 47 → 100 GB.**
+It steepens, so a single figure extrapolated from the small end understates the
+cost. This also supersedes the earlier 15%-per-doubling number, which came from
 two rows both taken with the discarded looped-power method.
 
-The 25 GB totals reproduce to **0.5%** (418 / 414 / 415 J) even though the
-individual merges are short enough to trip the under-10s warning: high
-within-run variance, very tight run-to-run totals.
+### What degrades is the SSD, not the sort
 
-Cycle 2's 47 GB merge is an outlier — 30.3s and 468 J against 23.1s/423 J and
-23.4s/431 J, and at the *lowest* power of the three, which reads as an I/O
-stall rather than extra work. Excluding it gives 3.3%. The conclusion does not
-turn on which you take.
-
-**What this does not cover is fan-in.** The split writes 5M-record runs, so
-this compared a 50-way merge against a 100-way one. At 10¹⁰ records the same
-configuration is **2000-way**, and at `BUFRECS=8192` the read buffers alone
-want roughly `10 threads × 2000 runs × 819 KB ≈ 16 GB`. Reaching that size
-means raising records-per-run, which costs RAM for the in-memory sort, or
-cutting `BUFRECS`, which costs I/O efficiency. A slope measured across a 2×
-change in fan-in is being extrapolated across a 20× one.
-
-Two observations from the superseded runs that still hold, because their wall
-clock was always measured on cold single runs — only the power was wrong:
-
-**The merge scaled linearly; the split did not.**
+The mechanism is visible in the power, and it is the most useful thing in this
+file. From 47 to 100 GB the split's own throughput fell 36% while its **power
+fell 25% and its SoC power fell 30%**. Time went up and the processor went
+*more* idle — that is the device falling off, not the algorithm costing more.
 
 ```
-split   x2.60 wall time for x2.0 data     but x1.99 user time
-merge   x2.12 wall time for x2.0 data
+split   19.3s -> 60.2s   for 2x data      (x3.13)
+power   22.2W -> 16.5W                    (-25%)
+SoC      7.2W ->  5.0W                    (-30%)
 ```
 
-The merge going linear was the good news, since fan-in was the part of the
-design most likely to break. The split's extra time is device I/O, not
-algorithm — its CPU scaled exactly 2.0×. Throughput fell 4.14 → 3.57 GB/s
-across those two runs.
+(The throughput row in the table above is whole-sort — 4× data over total time.
+The 36% is the split phase alone, where the effect is sharpest.)
 
-**Disk utilisation is a controllable variable rather than inherent scaling** —
+The likely cause is SLC cache exhaustion. Apple SSDs absorb writes into a fast
+pseudo-SLC region and fall back to native TLC speed once it fills. At 47 GB the
+split writes ~47 GiB of run files, which may fit; at 100 GB it writes ~93 GiB,
+which almost certainly does not.
+
+**If that is right, the penalty is a one-time step rather than a compounding
+one.** Past ~100 GB every write is already at native rate, so the slope should
+flatten back toward the small-scale behaviour instead of costing 12% per
+doubling forever. That gives a range rather than a number at 10¹⁰ records:
+
+| assumption | projected, wall-side |
+|---|---|
+| 12.2% continues across all 3.32 remaining doublings | **33.5 kJ** |
+| flattens back to ~4.5% past the cache | **~25 kJ** |
+
+Both include the ~10% charger loss `sys_power` excludes by construction.
+
+It is also an argument for a larger drive independent of capacity: more NAND
+means a larger SLC region and more headroom at the same absolute working set.
+
+### What this still does not cover
+
+**Fan-in.** The split writes 5M-record runs, so this reaches 200-way. At 10¹⁰
+records the same configuration is **2000-way**, and at `BUFRECS=8192` the read
+buffers alone want roughly `10 threads × 2000 runs × 819 KB ≈ 16 GB`. Getting
+there means raising records-per-run, which costs RAM for the in-memory sort, or
+cutting `BUFRECS`, which costs I/O efficiency. Neither is measured.
+
+**Reproducibility falls off with size** — 0.5% at 25 GB, 4.4% at 100 GB, with
+split times ranging 53.6–65.0 s. Rep 2 was fastest in *both* phases, which
+suggests something systematic (thermal cycling, or SSD housekeeping) rather
+than noise. The 12.2% figure would tighten with more reps; the conclusion would
+not change.
+
+**Disk utilisation** is a controllable variable rather than inherent scaling —
 separately worth 2× on merge throughput between ~50% and 75% full. The knee is
-higher than that range suggests, though: 50% vs 61% moved total energy by only
-0.5%, so the 2× is doing its work somewhere above 61% rather than accumulating
-steadily from 50.
+higher than that range suggests: 50% vs 61% moved total energy by only 0.5%, so
+the 2× is doing its work somewhere above 61% rather than accruing steadily from
+50. Peak fullness was ~58% at 47 GB and ~66% at 100 GB, so it is not what
+drives the 12.2%.
 
 ## Low Power Mode is the largest lever found
 
@@ -307,6 +322,10 @@ runs:
   configurations, derives its win threshold from a baseline it measures itself
   rather than one carried in, and records brightness at both ends so a change
   is caught rather than absorbed.
+- [`sweep_100gb.sh`](sweep_100gb.sh) — the 100 GB point. Forces
+  `lowpowermode 1` rather than trusting it, since that setting reset itself
+  between sessions once. Splits with the input present, then deletes it before
+  merging, which keeps peak fullness comparable to the smaller sizes.
 - [`sweep_scaling.sh`](sweep_scaling.sh) — measures the slope by interleaving
   two data sizes, so drift lands on both equally, and prints disk fullness
   before every timed run.
@@ -373,6 +392,11 @@ after writing tens of GB means competing with your own writeback.
 
 In priority order:
 
+- **Confirm the SLC-cache hypothesis.** The 12.2% slope is attributed to
+  sustained-write fall-off, and that attribution decides whether the penalty is
+  a one-time step or compounds. A write-only test at increasing sizes, watching
+  for the throughput knee, would settle it without running a sort at all — and
+  it is the difference between the 25 kJ and 33.5 kJ projections.
 - **`taskpolicy -c background -g default`.** The last untried flag combination
   that could isolate core type from disk policy. If it fails, per-thread QoS in
   code is the only remaining route.
@@ -385,10 +409,12 @@ In priority order:
   basis before measuring: 53% of the energy is SSD, board and display, so a
   whole-system comparison is largely chassis. SoC-vs-RAPL and
   wall-meter-vs-wall-meter answer different questions.
-- **Re-measure 100 GB** with the three-cold-run protocol. Now a third scaling
-  point and a 200-way fan-in check rather than the blocker it used to be —
-  though note its ~200 GB working set puts this machine near 70% full, which
-  confounds it against the 54–59% the slope was measured at.
+- **More reps at 100 GB.** Run-to-run spread there is 4.4% against 0.5% at
+  25 GB, and rep 2 was the fastest in both phases, which looks systematic
+  rather than random. Three more would tighten the 12.2%.
+- **A 200 GB point**, if a drive ever allows it. Two slopes cannot distinguish
+  "steepens once at the cache boundary" from "steepens continuously", and that
+  is the whole spread in the projection.
 - **A wall meter** for an AC-side figure. Everything here is DC-side and ~10%
   optimistic by construction.
 - **A thread-count sweep for joules**, not seconds. Still untested.
