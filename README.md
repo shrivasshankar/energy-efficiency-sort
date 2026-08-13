@@ -96,6 +96,14 @@ It steepens, so a single figure extrapolated from the small end understates the
 cost. This also supersedes the earlier 15%-per-doubling number, which came from
 two rows both taken with the discarded looped-power method.
 
+**Why 47 GB reads 868 J here and 850.7 J in the headline table.** Two sessions.
+The headline figure was measured on its own at 50% disk fullness; this column
+was measured interleaved with 25 GB a day later, at 54–59%. The 2% gap is
+slightly above the 1.3% within-session spread and in the direction the extra
+fullness predicts. Every slope on this page uses *this* column, because a slope
+has to come from points measured in one chain — mixing sessions would fold
+session drift into what is supposed to be a size effect.
+
 ### What degrades is the SSD, not the sort
 
 The mechanism is visible in the power, and it is the most useful thing in this
@@ -146,12 +154,18 @@ suggests something systematic (thermal cycling, or SSD housekeeping) rather
 than noise. The 12.2% figure would tighten with more reps; the conclusion would
 not change.
 
-**Disk utilisation** is a controllable variable rather than inherent scaling —
-separately worth 2× on merge throughput between ~50% and 75% full. The knee is
-higher than that range suggests: 50% vs 61% moved total energy by only 0.5%, so
-the 2× is doing its work somewhere above 61% rather than accruing steadily from
-50. Peak fullness was ~58% at 47 GB and ~66% at 100 GB, so it is not what
-drives the 12.2%.
+**Disk utilisation, which cannot be cleanly separated from the above.**
+Fullness is separately worth 2× on merge throughput between ~50% and 75%, and
+the knee sits above 61% — 50% vs 61% moved total energy by only 0.5%. Peak
+fullness was ~58% at 47 GB against ~66% at 100 GB, so the larger run may well
+have crossed it.
+
+That is not a competing explanation so much as the same one restated. Apple's
+SLC cache is *dynamic*, sized from available free space, so "the drive got
+fuller" and "the write cache got smaller" are one mechanism described two ways.
+Either way the conclusion is unchanged — what degrades is the device, not the
+sort — and either way a larger drive helps, since it buys both free space and
+cache at the same absolute working set.
 
 ## Low Power Mode is the largest lever found
 
