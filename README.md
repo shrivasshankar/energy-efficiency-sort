@@ -91,6 +91,10 @@ phase to hold peak fullness near the other two.
 | Merge fan-in | 50-way | 100-way | 200-way |
 | Run-to-run spread | 0.5% | 1.3% | 4.4% |
 
+Output is `valsort`-verified with zero duplicate keys at both sizes:
+`ee6b6a9da7427ce` at 47 GB, `1dcd615efb9dfe11` at 100 GB. Correctness was
+established separately from the energy runs, which measure an unmodified binary.
+
 **The slope is 4.2% per doubling from 25 → 47 GB, and 12.2% from 47 → 100 GB.**
 It steepens, so a single figure extrapolated from the small end understates the
 cost. This also supersedes the earlier 15%-per-doubling number, which came from
